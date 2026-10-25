@@ -7,12 +7,12 @@ final class StreamTests: XCTestCase {
     func testOutputSizeFollowsOrientation() {
         let encoder = VideoEncoder(settings: .init())
         // iPhone 15 screen buffers are 1179x2556, portrait.
-        let portrait = encoder.geometry(width: 1179, height: 2556, orientation: .up)
+        let portrait = encoder.outputGeometry(width: 1179, height: 2556, orientation: .up)
         XCTAssertEqual([portrait.width, portrait.height], [498, 1080])
-        let landscape = encoder.geometry(width: 1179, height: 2556, orientation: .right)
+        let landscape = encoder.outputGeometry(width: 1179, height: 2556, orientation: .right)
         XCTAssertEqual([landscape.width, landscape.height], [1920, 886])
         XCTAssertEqual(landscape.turn, .clockwise)
-        XCTAssertEqual(encoder.geometry(width: 1179, height: 2556, orientation: .left).turn, .counterclockwise)
+        XCTAssertEqual(encoder.outputGeometry(width: 1179, height: 2556, orientation: .left).turn, .counterclockwise)
     }
 
     /// Ten seconds of a landscape screen with a tone, end to end. With
@@ -35,7 +35,7 @@ final class StreamTests: XCTestCase {
         // A real-time encoder may drop the odd frame when fed faster than real time.
         XCTAssertGreaterThanOrEqual(video.count, 285)
         XCTAssertTrue(video.first?.1 ?? false, "the first frame must be a keyframe")
-        XCTAssertGreaterThanOrEqual(video.filter(\.1).count, 5, "a keyframe every 2 s")
+        XCTAssertGreaterThanOrEqual(video.filter { $0.1 }.count, 5, "a keyframe every 2 s")
         XCTAssertGreaterThan(audio.count, 200)
 
         // Video decode times are whole frames (3000 at 90 kHz), starting at

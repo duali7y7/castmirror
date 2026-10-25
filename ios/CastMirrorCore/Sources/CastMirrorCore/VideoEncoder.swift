@@ -74,7 +74,7 @@ final class VideoEncoder {
         }
     }
 
-    func geometry(width: Int, height: Int, orientation: CGImagePropertyOrientation) -> Geometry {
+    func outputGeometry(width: Int, height: Int, orientation: CGImagePropertyOrientation) -> Geometry {
         let turn = Self.turn(for: orientation)
         let (shownWidth, shownHeight) = turn.isQuarter ? (height, width) : (width, height)
         let scale = min(1, Double(settings.maxWidth) / Double(shownWidth), Double(settings.maxHeight) / Double(shownHeight))
@@ -86,14 +86,14 @@ final class VideoEncoder {
 
     /// Scales and turns a screen frame into a new buffer ready to encode.
     func prepare(_ source: CVPixelBuffer, orientation: CGImagePropertyOrientation) -> CVPixelBuffer? {
-        let wanted = geometry(width: CVPixelBufferGetWidth(source), height: CVPixelBufferGetHeight(source), orientation: orientation)
+        let wanted = outputGeometry(width: CVPixelBufferGetWidth(source), height: CVPixelBufferGetHeight(source), orientation: orientation)
         if wanted != geometry { rebuild(for: wanted) }
         guard let transfer, let scaledPool, let scaled = makeBuffer(scaledPool) else { return nil }
         var status = VTPixelTransferSessionTransferImage(transfer, from: source, to: scaled)
         guard status == noErr else { return failed("scale", status) }
         if wanted.turn == .none { return scaled }
         guard let rotation, let turnedPool, let turned = makeBuffer(turnedPool) else { return nil }
-        status = VTPixelRotationSessionRotateImage(rotation, from: scaled, to: turned)
+        status = VTPixelRotationSessionRotateImage(rotation, scaled, turned)
         guard status == noErr else { return failed("rotate", status) }
         return turned
     }
@@ -162,7 +162,7 @@ final class VideoEncoder {
         if wanted.turn != .none {
             if rotation == nil {
                 var session: VTPixelRotationSession?
-                VTPixelRotationSessionCreate(allocator: kCFAllocatorDefault, pixelRotationSessionOut: &session)
+                VTPixelRotationSessionCreate(kCFAllocatorDefault, &session)
                 rotation = session
             }
             let angle: CFString

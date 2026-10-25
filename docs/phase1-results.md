@@ -36,14 +36,18 @@ Desktop capture with ddagrab, x264 ultrafast, 1920x1080@30. The desktop was most
 | desktop | 8M      | no    | 200         | speed only    | 210–600           | 30        | 1 in 35 s          |               | too low |
 | desktop | 8M      | tone  | 400         | speed, jump at 3400 | 290–480     | 31–35     | 1 in 40 s          |               | stall and jump came from FFmpeg's tone input falling behind on the PC; no sound heard on the TV |
 | desktop | 8M      | tone  | 2000        | none (rate 1) | 1720–1830         | 31        | 0                  |               | tone heard |
-| desktop | 8M      | tone  | 1000 (default) | none, jump at 4000 | 1745–1900    | 29–31     | 0 in 30 s          |               | new default with sound |
+| desktop | 8M      | tone  | 1000 (default) | none, jump at 4000 | 1745–1900    | 29–31     | 0 in 30 s          | **1.93 s**    | new default with sound; photo: PC 33.423, TV 31.490 |
+
+The measured delay is the TV's buffer (about 1.8 s) plus about 0.13 s for capture, encoding, Wi-Fi and display.
 
 ## Open questions
 
-- End-to-end delay from the stopwatch photo, with and without sound.
+- Delay without sound wasn't photographed. From the buffer it should be about 0.5 s, but videos need sound, so it matters less.
 - A long run with a real video file (`--source file`) for smoothness and lip sync.
 
 ## Decision
 
 - [ ] Delay at or under ~500 ms and smooth, so go on to the iOS app (Phase 2)
 - [ ] Over ~1 s, so re-plan around Cast Streaming
+
+Result: 1.93 s with sound, smooth and in sync. That's over the ~1 s line, but what matters for watching videos is that sound and picture match, and they do. Cast Streaming (the protocol Chrome uses for tab mirroring) could get closer to 0.5 s with sound, but it's a much bigger build on the iPhone (encrypted RTP over UDP, Opus audio, retransmission). Waiting for the user's call.

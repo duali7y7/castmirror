@@ -19,6 +19,7 @@ import { DASHCAST_APP_ID, DASHCAST_NS, dashcastLoadMessage, receiverPageUrl } fr
 import { discoverChromecasts, localAddressFor } from './discovery.js';
 import { startFfmpeg } from './ffmpeg.js';
 import { FragmentSplitter } from './mp4.js';
+import { startReplay } from './replay.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(ROOT, 'castmirror.config.json'), 'utf8'));
@@ -40,8 +41,9 @@ Options:
                         dashcast opens the receiver page through the public
                         DashCast app, served from this PC, so no app ID is needed
   --page <url>          receiver page for dashcast      (default served from this PC)
-  --source <s>         desktop | test | file           (default desktop)
-  --file <path>         video file for --source file (loops)
+  --source <s>          desktop | test | file | replay  (default desktop)
+  --file <path>         video file for --source file (loops), or a stream
+                        recorded by the iOS tests for --source replay
   --capture <c>         ddagrab | gdigrab               (default ddagrab)
   --monitor <n>         monitor index for ddagrab       (default 0)
   --size <WxH>          output size                     (default 1920x1080)
@@ -127,7 +129,8 @@ class Stream {
       + `${this.opts.bitrate} via ${this.sink.kind}`);
     const startedAt = Date.now();
     this.splitter = new FragmentSplitter();
-    this.proc = startFfmpeg(this.opts, (d) => this.onData(d), (code) => {
+    const run = this.opts.source === 'replay' ? startReplay : startFfmpeg;
+    this.proc = run(this.opts, (d) => this.onData(d), (code) => {
       if (this.stopped) return;
       // Desktop capture ends whenever Windows takes the screen away (lock
       // screen, UAC prompt, display change), so start again. The new init

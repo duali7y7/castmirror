@@ -49,5 +49,11 @@ The measured delay is the TV's buffer (about 1.8 s) plus about 0.13 s for captur
 
 - [ ] Delay at or under ~500 ms and smooth, so go on to the iOS app (Phase 2)
 - [ ] Over ~1 s, so re-plan around Cast Streaming
+- [x] **Chosen: go on to Phase 2 with this approach at about 2 s.**
 
-Result: 1.93 s with sound, smooth and in sync. That's over the ~1 s line, but what matters for watching videos is that sound and picture match, and they do. Cast Streaming (the protocol Chrome uses for tab mirroring) could get closer to 0.5 s with sound, but it's a much bigger build on the iPhone (encrypted RTP over UDP, Opus audio, retransmission). Waiting for the user's call.
+Result: 1.93 s with sound, smooth and in sync. That's over the ~1 s line, but what matters for watching videos is that sound and picture match, and they do, so the user chose to keep this approach. Cast Streaming (the protocol Chrome uses for tab mirroring) could get closer to 0.5 s with sound, but it's a much bigger build on the iPhone (encrypted RTP over UDP, Opus audio, retransmission).
+
+What Phase 2 takes from this:
+- The iPhone opens the receiver through DashCast and serves the page itself over plain http, with the WebSocket on the same phone.
+- With sound, the receiver never changes speed on the Chromecast.
+- The audio track must never have gaps (the receiver only plays as far as both tracks reach), so the phone fills silences with silent AAC.

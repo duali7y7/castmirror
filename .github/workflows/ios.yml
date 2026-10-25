@@ -1,0 +1,65 @@
+# Tests CastMirrorCore on macOS, then builds the iPhone app unsigned. The
+# CastMirror-ipa artifact is what Sideloadly installs; sample-stream is a
+# recording of the app's stream format for checking on a Chromecast.
+name: iOS app
+
+on:
+  push:
+    paths:
+      - 'ios/**'
+      - 'receiver/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Test CastMirrorCore
+        working-directory: ios/CastMirrorCore
+        env:
+          CASTMIRROR_SAMPLE_OUT: ${{ github.workspace }}/sample
+        run: swift test
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sample-stream
+          path: sample
+          if-no-files-found: ignore
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build
+        working-directory: ios
+        run: |
+          xcodebuild -project CastMirror.xcodeproj -scheme CastMirror \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package the IPA
+        working-directory: ios
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CastMirror.app Payload/
+          ls Payload/CastMirror.app/PlugIns
+          ls Payload/CastMirror.app/PlugIns/BroadcastExtension.appex/receiver
+          zip -qry CastMirror.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CastMirror-ipa
+          path: ios/CastMirror.ipa

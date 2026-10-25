@@ -1,0 +1,63 @@
+# XcodeGen spec: CI runs `xcodegen generate` to make CastMirror.xcodeproj,
+# so there's no hand-made Xcode project to keep in sync.
+name: CastMirror
+options:
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  CastMirrorCore:
+    path: CastMirrorCore
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    # CI builds unsigned; Sideloadly signs with your Apple ID.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+targets:
+  CastMirror:
+    type: application
+    platform: iOS
+    sources:
+      - App
+    dependencies:
+      - target: BroadcastExtension
+      - package: CastMirrorCore
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: CastMirror
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSLocalNetworkUsageDescription: CastMirror finds your Chromecast and streams your screen to it over Wi-Fi.
+        NSBonjourServices: [_googlecast._tcp]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.duali7y7.castmirror
+  BroadcastExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - BroadcastExtension
+      # The receiver page, served to the Chromecast from the phone.
+      - path: ../receiver
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: CastMirrorCore
+    info:
+      path: BroadcastExtension/Info.plist
+      properties:
+        CFBundleDisplayName: CastMirror
+        NSLocalNetworkUsageDescription: CastMirror finds your Chromecast and streams your screen to it over Wi-Fi.
+        NSBonjourServices: [_googlecast._tcp]
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.duali7y7.castmirror.broadcast

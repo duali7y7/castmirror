@@ -488,7 +488,11 @@
   // ---------------------------------------------------------------- start
 
   if (directWs) {
-    els.overlay.hidden = params.get('debug') === '0';
+    // debug=0 hides the stats overlay; debug=<seconds> shows it for that long.
+    const debug = params.get('debug');
+    els.overlay.hidden = debug === '0';
+    const debugSecs = num(debug, 0);
+    if (debugSecs > 0) setTimeout(() => { els.overlay.hidden = true; }, debugSecs * 1000);
     connectWs(directWs, false);
   }
 

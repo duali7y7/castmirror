@@ -15,6 +15,7 @@ import { parseArgs } from 'node:util';
 import { WebSocketServer } from 'ws';
 
 import { CastClient } from './castv2.js';
+import { DASHCAST_APP_ID, DASHCAST_NS, dashcastLoadMessage, receiverPageUrl } from './dashcast.js';
 import { discoverChromecasts, localAddressFor } from './discovery.js';
 import { startFfmpeg } from './ffmpeg.js';
 import { FragmentSplitter } from './mp4.js';
@@ -35,7 +36,11 @@ Options:
   --host <ip>           Chromecast address (skips discovery)
   --name <text>         pick the Chromecast whose name contains <text>
   --app <id>            Cast app ID (default: castAppId in castmirror.config.json)
-  --source <s>          desktop | test | file           (default desktop)
+  --receiver <r>        custom | dashcast    (default custom, or dashcast with no app ID)
+                        dashcast opens the receiver page through the public
+                        DashCast app, served from this PC, so no app ID is needed
+  --page <url>          receiver page for dashcast      (default served from this PC)
+  --source <s>         desktop | test | file           (default desktop)
   --file <path>         video file for --source file (loops)
   --capture <c>         ddagrab | gdigrab               (default ddagrab)
   --monitor <n>         monitor index for ddagrab       (default 0)
@@ -48,8 +53,11 @@ Options:
   --audio               add a test tone (file sources keep their own audio)
   --transport <t>       auto | ws | cast                (default auto)
   --port <n>            WebSocket port                  (default 8765)
-  --target <ms>         receiver buffer target    (default 150, or 300 with audio)
-  --jump <ms>           receiver jumps to live past this     (default target + 450)
+  --target <ms>         receiver buffer target
+                        (default 400 on a Chromecast, 1000 with audio, where it can't
+                        speed up to catch up; 150, or 300 with audio, in a browser)
+  --jump <ms>           receiver jumps to live past this
+                        (default target + 3000 on a Chromecast, target + 450 in a browser)
   --quiet               hide the overlay on the TV
   --local               browser test mode (http://localhost:8080)
 `;
@@ -60,7 +68,9 @@ function parseOptions() {
       host: { type: 'string' },
       name: { type: 'string' },
       app: { type: 'string' },
-      source: { type: 'string', default: 'desktop' },
+      receiver: { type: 'string' },
+      page: { type: 'string' },
+      source:{ type: 'string', default: 'desktop' },
       file: { type: 'string' },
       capture: { type: 'string', default: 'ddagrab' },
       monitor: { type: 'string', default: '0' },
@@ -115,8 +125,19 @@ class Stream {
   start() {
     console.log(`[stream] starting ${this.opts.source} ${this.opts.width}x${this.opts.height}@${this.opts.fps} `
       + `${this.opts.bitrate} via ${this.sink.kind}`);
+    const startedAt = Date.now();
+    this.splitter = new FragmentSplitter();
     this.proc = startFfmpeg(this.opts, (d) => this.onData(d), (code) => {
-      if (!this.stopped) console.log(`[stream] ffmpeg exited (code ${code})`);
+      if (this.stopped) return;
+      // Desktop capture ends whenever Windows takes the screen away (lock
+      // screen, UAC prompt, display change), so start again. The new init
+      // segment makes the receiver start a fresh stream.
+      if (Date.now() - startedAt < 3000) {
+        console.log(`[stream] ffmpeg exited (code ${code}) right after starting, giving up`);
+        return;
+      }
+      console.log(`[stream] ffmpeg exited (code ${code}), restarting`);
+      this.restartTimer = setTimeout(() => this.start(), 1000);
     });
   }
 
@@ -164,6 +185,7 @@ class Stream {
     if (this.stopped) return;
     this.stopped = true;
     clearInterval(this.statsTimer);
+    clearTimeout(this.restartTimer);
     if (this.proc) this.proc.kill();
   }
 }
@@ -206,7 +228,9 @@ function handleReceiverMessage(msg, reply, onReady) {
     console.log('[tv] ' + msg.msg);
   } else if (msg.type === 'stats') {
     const s = msg.stats;
-    console.log(`[tv] ${s.res} @ ${s.fps} fps via ${s.transport}, buffer ${s.lagMs} ms, rtt ${s.rttMs} ms, `
+    console.log(`[tv] ${s.res} @ ${s.fps} fps via ${s.transport}, plays ${s.play}x (ready ${s.ready}`
+      + `${s.paused ? ', paused' : ''}), audio ${s.audio} (${s.audioKB} KB decoded), `
+      + `buffer ${s.lagMs} ms, rtt ${s.rttMs} ms, rate ${s.rate}, `
       + `${s.mbps} Mbps, dropped ${s.dropped}, jumps ${s.jumps}, stalls ${s.stalls}, queue max ${s.maxQueue}`);
   } else if (msg.type === 'ready' && onReady) {
     onReady(msg);
@@ -258,7 +282,8 @@ async function runList() {
   for (const d of devices) console.log(`  ${d.name}  ${d.host}  ${d.model}`);
 }
 
-function runLocal(opts) {
+// Serves the receiver page and the stopwatch from this checkout.
+function startHttpServer(opts, host) {
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
     const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
@@ -274,21 +299,45 @@ function runLocal(opts) {
         res.end('not found');
         return;
       }
-      res.writeHead(200, { 'content-type': types[path.extname(file)] || 'application/octet-stream' });
+      res.writeHead(200, {
+        'content-type': types[path.extname(file)] || 'application/octet-stream',
+        // Receiver edits take effect on the next cast.
+        'cache-control': 'no-store',
+      });
       res.end(body);
     });
   });
-  server.listen(opts.httpPort, '127.0.0.1');
+  server.on('error', (e) => {
+    console.error('[http] ' + e.message);
+    process.exit(1);
+  });
+  server.listen(opts.httpPort, host);
+  return server;
+}
+
+function runLocal(opts) {
+  startHttpServer(opts, '127.0.0.1');
   startWebSocketServer(opts, '127.0.0.1');
   console.log(`Open http://localhost:${opts.httpPort}/receiver/?ws=ws://localhost:${opts.port}`);
   console.log(`Stopwatch for delay tests: http://localhost:${opts.httpPort}/stopwatch.html`);
 }
 
 async function runCast(opts) {
-  const appId = opts.app || CONFIG.castAppId;
+  const mode = opts.receiver || (opts.app || CONFIG.castAppId ? 'custom' : 'dashcast');
+  if (mode !== 'custom' && mode !== 'dashcast') {
+    console.error('--receiver must be custom or dashcast.');
+    process.exit(1);
+  }
+  const dashcast = mode === 'dashcast';
+  const appId = dashcast ? DASHCAST_APP_ID : opts.app || CONFIG.castAppId;
   if (!appId) {
     console.error('No Cast app ID yet. Register the receiver in the Google Cast SDK Developer Console,\n'
-      + 'then put the ID in castmirror.config.json (castAppId) or pass --app <id>.');
+      + 'then put the ID in castmirror.config.json (castAppId) or pass --app <id>.\n'
+      + 'Or use --receiver dashcast, which needs no app ID.');
+    process.exit(1);
+  }
+  if (dashcast && opts.transport === 'cast') {
+    console.error('DashCast mode only works over the direct WebSocket (--transport ws).');
     process.exit(1);
   }
 
@@ -308,12 +357,14 @@ async function runCast(opts) {
   const lanIp = localAddressFor(device.host);
 
   if (opts.transport !== 'cast') startWebSocketServer(opts, '0.0.0.0');
+  if (dashcast) startHttpServer(opts, '0.0.0.0');
 
   const client = new CastClient();
   console.log(`Connecting to ${device.name} (${device.host})…`);
   await client.connect(device.host, device.port);
-  await client.launch(appId);
-  console.log('Receiver app running.');
+  // DashCast restarts so it is on its own page, ready to take an address.
+  await client.launch(appId, dashcast ? { namespace: DASHCAST_NS, restart: true } : { namespace: NS });
+  console.log(dashcast ? 'DashCast running.' : 'Receiver app running.');
 
   client.on('message', (namespace, data) => {
     if (namespace !== NS) return;
@@ -321,23 +372,43 @@ async function runCast(opts) {
       replaceStream(new Stream(opts, castSink(client)));
     });
   });
+  let stopping = false;
   const shutdown = async () => {
+    stopping = true;
     replaceStream(null);
     await client.stopApp();
     client.close();
     process.exit(0);
   };
-  client.on('app-closed', () => {
+  const appGone = () => {
+    if (stopping) return;
     console.log('The receiver app was closed on the Chromecast.');
     replaceStream(null);
     process.exit(0);
-  });
+  };
+  client.on('app-stopped', appGone);
+  // DashCast drops its Cast connection when it hands the TV over to the
+  // receiver page, which keeps running.
+  if (!dashcast) client.on('app-closed', appGone);
   client.on('close', () => {
+    if (stopping) return;
     console.log('Lost the connection to the Chromecast.');
     replaceStream(null);
     process.exit(1);
   });
   process.on('SIGINT', shutdown);
+
+  if (dashcast) {
+    const page = receiverPageUrl(opts.page || `http://${lanIp}:${opts.httpPort}/receiver/`, {
+      ws: `ws://${lanIp}:${opts.port}`,
+      debug: !opts.quiet,
+      target: opts.target,
+      jump: opts.jump,
+    });
+    client.sendToApp(DASHCAST_NS, dashcastLoadMessage(page));
+    console.log(`Opening ${page} on the TV. Ctrl+C stops.`);
+    return;
+  }
 
   client.sendToApp(NS, {
     type: 'hello',

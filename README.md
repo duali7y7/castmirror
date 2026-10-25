@@ -16,14 +16,15 @@ Low-delay mirroring of an iPhone screen and sound to a 2nd-gen (2015) Chromecast
 ## Status
 
 - [x] Receiver page and PC test sender, tested in a desktop browser
-- [ ] Receiver registered with Google Cast and tested on the Chromecast
+- [x] Receiver tested on the Chromecast, through DashCast
 - [ ] Delay measured (Phase 1 decision)
 - [ ] iPhone app
+- [ ] Own Cast app ID (optional while DashCast works)
 
 ## One-time setup
 
 1. **GitHub:** see [How GitHub fits in](#how-github-fits-in).
-2. **Google Cast developer registration** (one-time US$5):
+2. **Google Cast developer registration** (one-time US$5, optional for now). Until there's an app ID, the sender uses [DashCast](https://github.com/madmod/dashcast), a public Cast app that opens any web page on the Chromecast. It opens the receiver page, served from this PC. That works, but it depends on someone else's app staying online, so registration is the long-term route:
    1. Go to the [Google Cast SDK Developer Console](https://cast.google.com/publish), sign in, and pay the registration fee.
    2. Choose **Add New Application → Custom Receiver**. Name it `CastMirror` and set the receiver URL to `https://duali7y7.github.io/castmirror/receiver/`.
    3. Copy the **Application ID** (8 characters) into `castAppId` in `castmirror.config.json`.
@@ -48,6 +49,8 @@ That command finds Chromecasts on the network. To stream the desktop:
 npm start
 ```
 
+With no app ID in `castmirror.config.json`, this launches DashCast on the TV (replacing whatever is playing) and points it at `http://<this PC>:8080/receiver/`. The TV then connects straight back to the PC on port 8765. Ctrl+C stops it and returns the TV to its home screen.
+
 The first time, Windows asks whether Node.js may use the network: allow it on **private networks**. Otherwise the Chromecast can't reach the PC.
 
 Useful variations:
@@ -66,11 +69,11 @@ npm start -- --source file --file "C:\path\to\video.mp4"
 
 Run `npm start -- --help` to see every option.
 
-**To measure:** open `https://duali7y7.github.io/castmirror/stopwatch.html` full screen on the PC and take one photo that shows the PC screen and the TV. The difference between the two clocks is the delay. The terminal prints the TV's own stats every 5 seconds (`[tv] ...` lines). Record the runs in `docs/phase1-results.md`.
+**To measure:** while the sender runs, open `http://localhost:8080/stopwatch.html` (or `https://duali7y7.github.io/castmirror/stopwatch.html`) full screen on the PC, and take one photo that shows the PC screen and the TV. The difference between the two clocks is the delay. The terminal prints the TV's own stats every 5 seconds (`[tv] ...` lines). Record the runs in `docs/phase1-results.md`.
 
 **Testing without a Chromecast:** `npm run local` opens a local test server. Open the address it prints in Chrome.
 
-**Receiver updates** can take up to 10 minutes to reach the Chromecast, because GitHub Pages caches the page.
+**Receiver updates:** through DashCast, the TV loads the receiver from this PC, so edits apply on the next `npm start`. Through a registered app ID it loads from GitHub Pages, which can take up to 10 minutes to show changes because of caching.
 
 ## How GitHub fits in
 

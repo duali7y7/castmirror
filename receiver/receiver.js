@@ -17,23 +17,41 @@
   const CAF_URL = 'https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js';
   const params = new URLSearchParams(location.search);
   const isCast = /CrKey/.test(navigator.userAgent);
+  // ?ws=ws://host:port connects straight to the sender instead of waiting for
+  // a hello over the Cast channel. Browser test mode works this way, and so
+  // does the sender's DashCast mode, which opens this page through another
+  // Cast app.
+  const directWs = params.get('ws');
 
   // Seconds of buffer to aim for, and how far behind to jump straight to the
-  // edge. Null means pick by stream: Chrome's audio renderer stalls below
-  // ~300 ms, while video alone plays smoothly at ~150 ms.
+  // edge. Null means pick by device and stream: desktop Chrome's audio
+  // renderer stalls below ~300 ms, while video alone plays smoothly at
+  // ~150 ms. The 2015 Chromecast runs dry below ~300 ms, and every jump
+  // restarts its hardware decoder from the previous keyframe, so there it
+  // catches up by playing faster and jumps only when far behind. With sound
+  // it can't play faster either (see canChangeRate), so the delay stays at
+  // what it buffers on start-up, about 1.7 s.
   const config = {
     targetLag: num(params.get('target'), null),
     jumpLag: num(params.get('jump'), null),
-    maxRate: 1.25,
+    maxRate: num(params.get('rate'), 1.25),
   };
 
   function targetLag() {
     if (config.targetLag !== null) return config.targetLag;
+    if (isCast) return player.hasAudio ? 1 : 0.4;
     return player.hasAudio ? 0.3 : 0.15;
   }
 
   function jumpLag() {
-    return config.jumpLag !== null ? config.jumpLag : targetLag() + 0.45;
+    if (config.jumpLag !== null) return config.jumpLag;
+    return targetLag() + (isCast ? 3 : 0.45);
+  }
+
+  // The Chromecast's sound goes silent once playbackRate changes, and stays
+  // silent after it goes back to 1.
+  function canChangeRate() {
+    return !(isCast && player.hasAudio);
   }
 
   const els = {
@@ -75,7 +93,10 @@
       this.started = false;
       this.mime = '';
       this.hasAudio = false;
-      this.stats = { bytes: 0, chunks: 0, jumps: 0, stalls: 0, maxQueue: 0 };
+      this.stats = { bytes: 0, chunks: 0, jumps: 0, stalls: 0, maxQueue: 0, played: 0 };
+      this.lastTime = 0;
+      this.jumpTo = -Infinity;
+      this.jumpedAt = 0;
 
       video.addEventListener('waiting', () => { if (this.started) this.stats.stalls++; });
       video.addEventListener('playing', () => els.idle.classList.add('hidden'));
@@ -111,6 +132,8 @@
       this.queue = [init];
       this.sb = null;
       this.started = false;
+      this.lastTime = 0;
+      this.jumpTo = -Infinity;
       const ms = new MediaSource();
       this.ms = ms;
       this.video.src = URL.createObjectURL(ms);
@@ -162,10 +185,11 @@
       if (!this.sb || !v.buffered.length) return;
       const ranges = v.buffered;
       const end = ranges.end(ranges.length - 1);
+      const now = Date.now();
 
       const target = targetLag();
       if (!this.started) {
-        v.currentTime = Math.max(ranges.start(ranges.length - 1), end - target);
+        this.seek(Math.max(ranges.start(ranges.length - 1), end - target), now);
         this.started = true;
         const p = v.play();
         if (p && p.catch) {
@@ -174,17 +198,37 @@
         return;
       }
 
+      // Media time played since the last tick: the stats use it to show
+      // whether the video is really moving, since the Chromecast's frame
+      // counters stay at zero.
+      const step = v.currentTime - this.lastTime;
+      if (step > 0 && step < 1) this.stats.played += step;
+      this.lastTime = v.currentTime;
+
+      // After a jump the decoder starts again from the previous keyframe,
+      // which takes the Chromecast a moment. Jumping again before playback
+      // moves would restart that and never catch up.
+      const settling = v.currentTime < this.jumpTo + 0.2 && now - this.jumpedAt < 3000;
       const lag = end - v.currentTime;
-      if (lag > jumpLag() || !inRanges(ranges, v.currentTime)) {
-        v.currentTime = Math.max(0, end - target);
+      if (settling) {
+        if (v.playbackRate !== 1) v.playbackRate = 1;
+      } else if (lag > jumpLag() || !inRanges(ranges, v.currentTime)) {
+        this.seek(Math.max(0, end - target), now);
         v.playbackRate = 1;
         this.stats.jumps++;
-      } else if (lag > target + 0.04) {
+      } else if (lag > target + 0.04 && canChangeRate()) {
         v.playbackRate = Math.min(config.maxRate, 1 + (lag - target) * 1.5);
       } else if (v.playbackRate !== 1) {
         v.playbackRate = 1;
       }
       this.trim(3);
+    }
+
+    seek(t, now) {
+      this.video.currentTime = t;
+      this.jumpTo = t;
+      this.jumpedAt = now;
+      this.lastTime = t;
     }
 
     lag() {
@@ -360,7 +404,8 @@
     castContext = framework.CastReceiverContext.getInstance();
     castContext.addCustomMessageListener(NS, (e) => handleControl(e.data));
     castContext.addEventListener(framework.system.EventType.SENDER_DISCONNECTED, () => {
-      if (castContext.getSenders().length === 0) {
+      // With a direct connection the sender isn't on the Cast channel at all.
+      if (!directWs && castContext.getSenders().length === 0) {
         setStatus('Sender disconnected');
         els.idle.classList.remove('hidden');
       }
@@ -377,7 +422,7 @@
 
   // ---------------------------------------------------------------- stats
 
-  let lastStats = { time: Date.now(), bytes: 0, frames: 0, dropped: 0 };
+  let lastStats = { time: Date.now(), bytes: 0, frames: 0, dropped: 0, played: 0 };
 
   function videoQuality() {
     const v = els.video;
@@ -399,6 +444,12 @@
       dropped: q.dropped,
       mbps: Math.round(((player.stats.bytes - lastStats.bytes) * 8) / secs / 1e5) / 10,
       lagMs: Math.round(player.lag() * 1000),
+      // Seconds of video played per second; about 1 when playing normally.
+      play: Math.round(((player.stats.played - lastStats.played) / secs) * 100) / 100,
+      ready: els.video.readyState,
+      paused: els.video.paused,
+      audio: !player.hasAudio ? 'none' : els.video.muted ? 'muted' : 'vol ' + Math.round(els.video.volume * 100),
+      audioKB: Math.round((els.video.webkitAudioDecodedByteCount || 0) / 1024),
       rate: Math.round(els.video.playbackRate * 100) / 100,
       queue: player.queue.length,
       maxQueue: player.stats.maxQueue,
@@ -406,7 +457,7 @@
       stalls: player.stats.stalls,
       rttMs: rtt,
     };
-    lastStats = { time: now, bytes: player.stats.bytes, frames: q.frames, dropped: q.dropped };
+    lastStats = { time: now, bytes: player.stats.bytes, frames: q.frames, dropped: q.dropped, played: player.stats.played };
     player.stats.maxQueue = player.queue.length;
     return s;
   }
@@ -421,6 +472,8 @@
         'network   ' + s.mbps + ' Mbps   rtt ' + (s.rttMs < 0 ? '-' : s.rttMs + ' ms') + '\n' +
         'buffer    ' + s.lagMs + ' ms (target ' + Math.round(targetLag() * 1000) + ')   rate ' + s.rate +
           '   queue ' + s.queue + ' (max ' + s.maxQueue + ')\n' +
+        'playback  ' + s.play + 'x   ready ' + s.ready + (s.paused ? '   paused' : '') +
+          '   audio ' + s.audio + ' (' + s.audioKB + ' KB decoded)\n' +
         'events    jumps ' + s.jumps + '   stalls ' + s.stalls + '\n\n' +
         logLines.join('\n');
     }
@@ -434,20 +487,28 @@
 
   // ---------------------------------------------------------------- start
 
+  if (directWs) {
+    els.overlay.hidden = params.get('debug') === '0';
+    connectWs(directWs, false);
+  }
+
+  // On the Chromecast the Cast library also starts with a direct connection,
+  // so the device sees a running receiver and the idle timeout stays off.
   if (isCast) {
     const script = document.createElement('script');
     script.src = CAF_URL;
-    script.onload = startCast;
-    script.onerror = () => setStatus('Could not load the Cast receiver library');
+    script.onload = () => {
+      try {
+        startCast();
+      } catch (e) {
+        log('cast receiver failed to start: ' + e.message);
+      }
+    };
+    script.onerror = () => {
+      if (!directWs) setStatus('Could not load the Cast receiver library');
+    };
     document.head.appendChild(script);
-  } else {
-    // Browser test mode: ?ws=ws://localhost:8765
-    els.overlay.hidden = params.get('debug') === '0';
-    const url = params.get('ws');
-    if (url) {
-      connectWs(url, false);
-    } else {
-      setStatus('Test mode: add ?ws=ws://host:port to the address');
-    }
+  } else if (!directWs) {
+    setStatus('Test mode: add ?ws=ws://host:port to the address');
   }
 })();

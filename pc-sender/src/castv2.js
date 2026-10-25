@@ -180,19 +180,43 @@ export class CastClient extends EventEmitter {
     if (msg.namespace === NS_CONNECTION && data.type === 'CLOSE' && msg.source === this.transportId) {
       this.emit('app-closed');
     }
+    // The device announces every status change, including our app stopping or
+    // another app taking over the TV.
+    if (msg.namespace === NS_RECEIVER && data.type === 'RECEIVER_STATUS' && this.sessionId
+        && !statusApps(data).some((a) => a.sessionId === this.sessionId)) {
+      this.sessionId = null;
+      this.emit('app-stopped');
+    }
     this.emit('message', msg.namespace, data, msg.source);
   }
 
   // Launches the receiver app (or joins it if already running) and opens a
-  // virtual connection to it.
-  async launch(appId) {
+  // virtual connection to it. With `namespace`, waits until the app's page
+  // has registered it, since messages sent before then are dropped. `restart`
+  // stops a running copy first, so the app starts over from its own page.
+  async launch(appId, { namespace, restart = false } = {}) {
+    if (restart) {
+      const running = findApp(await this.request('receiver-0', NS_RECEIVER, { type: 'GET_STATUS' }), appId);
+      if (running) {
+        try {
+          await this.request('receiver-0', NS_RECEIVER, { type: 'STOP', sessionId: running.sessionId }, 5000);
+        } catch (e) {
+          // Stopped anyway, or about to be replaced by the launch.
+        }
+      }
+    }
+    const ready = (reply) => {
+      const found = findApp(reply, appId);
+      if (!found || (namespace && !(found.namespaces || []).some((n) => n.name === namespace))) return null;
+      return found;
+    };
     let reply = await this.request('receiver-0', NS_RECEIVER, { type: 'LAUNCH', appId });
     if (reply.type === 'LAUNCH_ERROR') throw new Error('launch failed: ' + (reply.reason || 'unknown'));
-    let app = findApp(reply, appId);
-    for (let i = 0; !app && i < 20; i++) {
+    let app = ready(reply);
+    for (let i = 0; !app && i < 40; i++) {
       await new Promise((r) => setTimeout(r, 500));
       reply = await this.request('receiver-0', NS_RECEIVER, { type: 'GET_STATUS' });
-      app = findApp(reply, appId);
+      app = ready(reply);
     }
     if (!app) throw new Error('the Chromecast did not start app ' + appId);
     this.transportId = app.transportId;
@@ -225,7 +249,10 @@ export class CastClient extends EventEmitter {
   }
 }
 
+function statusApps(reply) {
+  return (reply && reply.status && reply.status.applications) || [];
+}
+
 function findApp(reply, appId) {
-  const apps = (reply && reply.status && reply.status.applications) || [];
-  return apps.find((a) => a.appId === appId);
+  return statusApps(reply).find((a) => a.appId === appId);
 }

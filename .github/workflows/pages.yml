@@ -1,0 +1,46 @@
+# Publishes the Chromecast receiver page to GitHub Pages:
+#   https://<user>.github.io/castmirror/receiver/
+#   https://<user>.github.io/castmirror/stopwatch.html
+name: Publish receiver
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'receiver/**'
+      - 'tools/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site/receiver
+          cp -r receiver/. _site/receiver/
+          cp tools/stopwatch.html _site/stopwatch.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CastMirror stopwatch</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: #fff;
+      font-family: Consolas, "Roboto Mono", monospace;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    #clock {
+      font-size: 14vw;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+    p {
+      max-width: 40em;
+      padding: 0 16px;
+      color: #999;
+      font: 16px/1.5 system-ui, sans-serif;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="clock">00:00.000</div>
+  <p>Mirror this screen to the TV, then take one photo that shows both this screen and the TV.
+    The difference between the two times is the delay.</p>
+  <script>
+    const clock = document.getElementById('clock');
+    const pad = (n, w) => String(n).padStart(w, '0');
+    function frame() {
+      const d = new Date();
+      clock.textContent = pad(d.getMinutes(), 2) + ':' + pad(d.getSeconds(), 2) + '.' + pad(d.getMilliseconds(), 3);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>

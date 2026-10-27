@@ -4,9 +4,9 @@ import CoreVideo
 import Foundation
 import ImageIO
 
-/// Turns screen frames and app audio into the fragmented MP4 chunks the
-/// receiver plays: an init segment, then one fragment per video frame and
-/// one per batch of audio packets.
+/// Turns screen frames (and app audio, if included) into the fragmented MP4
+/// chunks the receiver plays: an init segment, then one fragment per video
+/// frame and one per batch of audio packets.
 ///
 /// Frames go out at a fixed rate: ReplayKit only delivers a frame when the
 /// screen changes, so on each tick the newest frame is encoded again if
@@ -18,6 +18,9 @@ public final class MirrorStream: @unchecked Sendable {
         public var bitrate = 6_000_000
         public var maxWidth = 1920
         public var maxHeight = 1080
+        /// With sound, the Chromecast holds about 2 s of stream and can't
+        /// catch up; without, about 0.4 s. So the sound stays on the phone.
+        public var includeAudio = false
 
         public init() {}
     }
@@ -51,9 +54,9 @@ public final class MirrorStream: @unchecked Sendable {
         self.settings = settings
         video = VideoEncoder(settings: .init(maxWidth: settings.maxWidth, maxHeight: settings.maxHeight,
                                              fps: settings.fps, bitrate: settings.bitrate, keyframeInterval: settings.fps * 2))
-        audio = AudioEncoder()
-        if audio == nil { logInfo("audio: no AAC encoder, sending video only") }
-        videoOffset = UInt64(AudioEncoder.primingSamples) * UInt64(FMP4.videoTimescale) / UInt64(AudioEncoder.sampleRate)
+        audio = settings.includeAudio ? AudioEncoder() : nil
+        if settings.includeAudio && audio == nil { logInfo("audio: no AAC encoder, sending video only") }
+        videoOffset = audio == nil ? 0 : UInt64(AudioEncoder.primingSamples) * UInt64(FMP4.videoTimescale) / UInt64(AudioEncoder.sampleRate)
         video.onFrame = { [weak self] frame in
             self?.queue.async { self?.emitVideo(frame) }
         }

@@ -62,13 +62,15 @@ final class VideoEncoder {
         invalidate()
     }
 
-    /// How ReplayKit's orientation attachment says to turn the frame.
-    /// CGImagePropertyOrientation follows EXIF: .right (6) means rotate 90°
-    /// clockwise to display it, .left (8) means 90° counterclockwise.
+    /// How ReplayKit's orientation attachment says to turn the frame. On the
+    /// iPhone it's the opposite of the EXIF reading of
+    /// CGImagePropertyOrientation: turning .right (6) clockwise showed
+    /// landscape upside down on the TV, so .right turns counterclockwise and
+    /// .left (8) clockwise.
     static func turn(for orientation: CGImagePropertyOrientation) -> Turn {
         switch orientation {
-        case .right, .rightMirrored: return .clockwise
-        case .left, .leftMirrored: return .counterclockwise
+        case .right, .rightMirrored: return .counterclockwise
+        case .left, .leftMirrored: return .clockwise
         case .down, .downMirrored: return .upsideDown
         default: return .none
         }
@@ -203,6 +205,8 @@ final class VideoEncoder {
             (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_4_1),
             // No B-frames, so every frame can be shown as soon as it arrives.
             (kVTCompressionPropertyKey_AllowFrameReordering, NSNumber(value: false)),
+            // And no frame held back inside the encoder.
+            (kVTCompressionPropertyKey_MaxFrameDelayCount, NSNumber(value: 0)),
             (kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CABAC),
             (kVTCompressionPropertyKey_AverageBitRate, settings.bitrate as NSNumber),
             // Short bursts up to 1.5x the average, then it must slow down.

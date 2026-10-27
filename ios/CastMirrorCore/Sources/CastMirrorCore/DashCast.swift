@@ -17,7 +17,7 @@ public enum DashCast {
 
     /// The receiver page address, carrying what the hello message would
     /// otherwise send over the Cast channel. `debugSeconds` shows the stats
-    /// overlay for that long.
+    /// overlay for that long: 0 hides it, nil keeps it up.
     public static func receiverPageURL(base: String, webSocket: String, debugSeconds: Int?) -> String {
         guard var components = URLComponents(string: base) else { return base }
         var items = components.queryItems ?? []

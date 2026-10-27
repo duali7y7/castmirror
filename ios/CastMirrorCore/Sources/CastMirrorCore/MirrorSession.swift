@@ -30,12 +30,20 @@ public final class MirrorSession: @unchecked Sendable {
     private var keyframeRequested = false
     private var dropped = 0
     private var stopped = false
+    private var showStats: Bool
 
-    public init(receiverDirectory: URL?, settings: MirrorStream.Settings = .init()) {
+    public init(receiverDirectory: URL?, settings: MirrorStream.Settings = .init(), showStats: Bool = false) {
         stream = MirrorStream(settings: settings)
         http = HTTPServer(receiverDirectory: receiverDirectory)
         // About 0.3 s of video.
         backlogLimit = max(256 * 1024, settings.bitrate / 8 * 3 / 10)
+        self.showStats = showStats
+    }
+
+    /// Shows or hides the stats overlay on the TV, straight away if it's connected.
+    public func setShowStats(_ show: Bool) {
+        lock.withLock { showStats = show }
+        sendJSON(["type": "overlay", "show": show])
     }
 
     public func start() {
@@ -106,10 +114,16 @@ public final class MirrorSession: @unchecked Sendable {
             throw MirrorError("Couldn't find this phone's Wi-Fi address.")
         }
         try await cast.launch(appId: DashCast.appId, waitingFor: DashCast.namespace, restart: true)
+        // No debug time keeps the stats up the whole time; 0 hides them.
         let page = DashCast.receiverPageURL(base: "http://\(address):\(httpPort)/receiver/",
-                                            webSocket: "ws://\(address):\(webSocketPort)", debugSeconds: 30)
+                                            webSocket: "ws://\(address):\(webSocketPort)",
+                                            debugSeconds: statsShown() ? nil : 0)
         cast.sendToApp(namespace: DashCast.namespace, DashCast.loadMessage(url: page))
         logInfo("opening \(page) on \(device.name)")
+    }
+
+    private func statsShown() -> Bool {
+        lock.withLock { showStats }
     }
 
     private func fail(_ message: String) {
@@ -125,10 +139,13 @@ public final class MirrorSession: @unchecked Sendable {
     // MARK: - Receiver
 
     private func receiverConnected() {
-        lock.withLock {
+        let show: Bool = lock.withLock {
             waitingForKeyframe = true
             keyframeRequested = true
+            return showStats
         }
+        // In case the setting changed after the page was opened.
+        sendJSON(["type": "overlay", "show": show])
         if let segment = stream.currentInitSegment { webSocket.send(segment) }
         stream.requestKeyframe()
     }

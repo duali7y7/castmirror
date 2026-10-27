@@ -18,7 +18,8 @@ Low-delay mirroring of an iPhone screen and sound to a 2nd-gen (2015) Chromecast
 - [x] Receiver page and PC test sender, tested in a desktop browser
 - [x] Receiver tested on the Chromecast, through DashCast
 - [x] Delay measured: 1.93 s with sound, in sync (see `docs/phase1-results.md`)
-- [ ] iPhone app: built by CI, not yet tried on the phone
+- [x] iPhone app: mirrors to the TV (first test on an iPhone 15, iOS 27)
+- [ ] v1: picture only, lower delay, upright landscape, stats switch (built, to test on the phone)
 - [ ] Own Cast app ID (optional while DashCast works)
 
 ## One-time setup
@@ -93,12 +94,16 @@ Each install:
 Using it:
 1. Open **CastMirror**. It searches for Chromecasts. Allow **Local Network** access when iOS asks; the broadcast needs it.
 2. Tap the round button, then **Start Broadcast**. (Or long-press **Screen Recording** in Control Center and pick CastMirror.)
-3. The TV switches to CastMirror. Open your video app. Sound and picture reach the TV about 2 seconds after the phone.
+3. The TV switches to CastMirror. Open your video app. The picture reaches the TV about half a second after the phone. Sound plays from the phone: with sound in the stream, the Chromecast holds about 2 s of it and can't catch up (see `docs/phase1-results.md`), so v1 sends picture only.
 4. To stop, tap the red indicator at the top of the screen and **Stop**.
+
+Tips:
+- **Show stats on the TV** in the app puts frame rate, buffer and network figures over the picture. It applies straight away while mirroring.
+- The TV's **Game** picture mode cuts the TV's own processing time.
 
 If something goes wrong:
 - If the broadcast stops by itself, iOS shows the reason.
-- The TV shows its stats and the last log lines for the first 30 seconds.
+- Turn on **Show stats on the TV** to see the TV's stats and the last log lines.
 - While a broadcast is running, open `http://localhost:8080/status` in Safari on the phone to see the phone's log, including the TV's stats every 5 seconds.
 
 ## How GitHub fits in
@@ -106,7 +111,7 @@ If something goes wrong:
 GitHub does three jobs:
 
 1. **Stores the code.** This folder is a git repository, pushed to `github.com/duali7y7/castmirror`.
-2. **Builds the iPhone app.** Only a Mac can build iPhone apps, so each push that touches `ios/` or `receiver/` runs `.github/workflows/ios.yml` on one of GitHub's free cloud Macs. It runs the core's tests, then produces the installable `.ipa`, plus `sample-stream`: 10 seconds of the app's stream format, which `npm start -- --source replay --file landscape.mp4` plays on the Chromecast from the PC.
+2. **Builds the iPhone app.** Only a Mac can build iPhone apps, so each push that touches `ios/` or `receiver/` runs `.github/workflows/ios.yml` on one of GitHub's free cloud Macs. It runs the core's tests, then produces the installable `.ipa`, plus `sample-stream`: 10 seconds of the app's stream format, which `npm start -- --source replay --file landscape-video.mp4` plays on the Chromecast from the PC. (`landscape.mp4` is the same with a test tone, for when sound comes back.)
 3. **Hosts the receiver page.** Google requires a permanent HTTPS address for it, and GitHub Pages provides one (`.github/workflows/pages.yml`).
 
 The repository is public, so build time and Pages hosting are free. Nothing in it is secret; the Cast app ID isn't secret either.

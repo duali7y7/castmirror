@@ -232,7 +232,7 @@ function handleReceiverMessage(msg, reply, onReady) {
   } else if (msg.type === 'stats') {
     const s = msg.stats;
     console.log(`[tv] ${s.res} @ ${s.fps} fps via ${s.transport}, plays ${s.play}x (ready ${s.ready}`
-      + `${s.paused ? ', paused' : ''}), audio ${s.audio} (${s.audioKB} KB decoded), `
+      + `${s.paused ? ', paused' : ''}), audio ${s.audio}, `
       + `buffer ${s.lagMs} ms, rtt ${s.rttMs} ms, rate ${s.rate}, `
       + `${s.mbps} Mbps, dropped ${s.dropped}, jumps ${s.jumps}, stalls ${s.stalls}, queue max ${s.maxQueue}`);
   } else if (msg.type === 'ready' && onReady) {

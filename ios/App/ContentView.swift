@@ -7,6 +7,9 @@ import SwiftUI
 /// does the streaming.
 struct ContentView: View {
     @StateObject private var finder = ChromecastFinder()
+    @StateObject private var relay = SettingsRelay()
+    @AppStorage(SettingsRelay.showStatsKey) private var showStats = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack {
@@ -42,16 +45,45 @@ struct ContentView: View {
                 }
 
                 Section("3. Watch") {
-                    Text("Open your video app. Picture and sound play on the TV about 2 seconds behind the phone, in step with each other.")
-                    Text("If you hear the phone as well, turn the phone's volume down.")
-                        .foregroundStyle(.secondary)
+                    Text("Open your video app. The picture shows on the TV about half a second behind the phone. Sound plays from the phone.")
                     Text("To stop, tap the red recording indicator at the top of the screen.")
                         .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Toggle("Show stats on the TV", isOn: $showStats)
+                } footer: {
+                    Text("Frame rate, buffer and network figures over the picture, for checking the delay. Changes apply straight away while mirroring.")
                 }
             }
             .navigationTitle("CastMirror")
         }
-        .onAppear { finder.search() }
+        .onAppear {
+            finder.search()
+            relay.start()
+        }
+        .onChange(of: showStats) { _, show in OptionsChannel.post(showStats: show) }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { relay.send() }
+        }
+    }
+}
+
+/// Sends the app's settings to the broadcast extension, which can't read
+/// them itself: on each change, when the app comes back, and when a
+/// broadcast starts (the app is still open behind the broadcast sheet then).
+final class SettingsRelay: ObservableObject {
+    static let showStatsKey = "showStats"
+
+    private var observation: OptionsChannel.Observation?
+
+    func start() {
+        guard observation == nil else { return }
+        observation = OptionsChannel.observeStarted(queue: .main) { [weak self] in self?.send() }
+    }
+
+    func send() {
+        OptionsChannel.post(showStats: UserDefaults.standard.bool(forKey: Self.showStatsKey))
     }
 }
 

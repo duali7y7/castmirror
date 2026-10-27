@@ -449,7 +449,6 @@
       ready: els.video.readyState,
       paused: els.video.paused,
       audio: !player.hasAudio ? 'none' : els.video.muted ? 'muted' : 'vol ' + Math.round(els.video.volume * 100),
-      audioKB: Math.round((els.video.webkitAudioDecodedByteCount || 0) / 1024),
       rate: Math.round(els.video.playbackRate * 100) / 100,
       queue: player.queue.length,
       maxQueue: player.stats.maxQueue,
@@ -473,7 +472,7 @@
         'buffer    ' + s.lagMs + ' ms (target ' + Math.round(targetLag() * 1000) + ')   rate ' + s.rate +
           '   queue ' + s.queue + ' (max ' + s.maxQueue + ')\n' +
         'playback  ' + s.play + 'x   ready ' + s.ready + (s.paused ? '   paused' : '') +
-          '   audio ' + s.audio + ' (' + s.audioKB + ' KB decoded)\n' +
+          '   audio ' + s.audio + '\n' +
         'events    jumps ' + s.jumps + '   stalls ' + s.stalls + '\n\n' +
         logLines.join('\n');
     }

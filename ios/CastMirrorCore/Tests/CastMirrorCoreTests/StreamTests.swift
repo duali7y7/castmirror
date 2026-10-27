@@ -11,8 +11,24 @@ final class StreamTests: XCTestCase {
         XCTAssertEqual([portrait.width, portrait.height], [498, 1080])
         let landscape = encoder.outputGeometry(width: 1179, height: 2556, orientation: .right)
         XCTAssertEqual([landscape.width, landscape.height], [1920, 886])
-        XCTAssertEqual(landscape.turn, .clockwise)
-        XCTAssertEqual(encoder.outputGeometry(width: 1179, height: 2556, orientation: .left).turn, .counterclockwise)
+        XCTAssertEqual(landscape.turn, .counterclockwise)
+        XCTAssertEqual(encoder.outputGeometry(width: 1179, height: 2556, orientation: .left).turn, .clockwise)
+    }
+
+    /// The stream is picture only unless sound is asked for. Saved as
+    /// `landscape-video.mp4` for replaying on a Chromecast, like the
+    /// landscape test below.
+    func testNoSoundByDefault() throws {
+        let chunks = try record(seconds: 10, orientations: [.right], includeAudio: nil)
+        guard case .initSegment(let segment) = chunks.first else { return XCTFail("stream must start with the init segment") }
+        let tracks = Box.read(segment).last?.children.filter { $0.type == "trak" } ?? []
+        XCTAssertEqual(tracks.count, 1)
+        XCTAssertFalse(chunks.contains { if case .audio = $0 { return true } else { return false } })
+        XCTAssertGreaterThanOrEqual(chunks.count, 286)
+        // Without the AAC start-up delay, video starts at zero.
+        guard chunks.count > 1, case .video(let first, _) = chunks[1] else { return XCTFail("the init segment must be followed by video") }
+        XCTAssertEqual(decodeTime(of: first), 0)
+        try saveSample(chunks, as: "landscape-video.mp4")
     }
 
     /// Ten seconds of a landscape screen with a tone, end to end. With
@@ -20,7 +36,7 @@ final class StreamTests: XCTestCase {
     /// checked with FFmpeg and played on a Chromecast with
     /// `npm start -- --source replay --file landscape.mp4`.
     func testLandscapeStreamWithSound() throws {
-        let chunks = try record(seconds: 10, orientations: [.right])
+        let chunks = try record(seconds: 10, orientations: [.right], includeAudio: true)
         let inits = chunks.filter { if case .initSegment = $0 { return true } else { return false } }
         XCTAssertEqual(inits.count, 1)
         guard case .initSegment(let segment) = chunks.first else { return XCTFail("stream must start with the init segment") }
@@ -46,15 +62,7 @@ final class StreamTests: XCTestCase {
         XCTAssertTrue(times.allSatisfy { $0 >= 3960 && ($0 - 3960) % 3000 == 0 })
         XCTAssertLessThanOrEqual(times.last ?? 0, 3960 + 299 * 3000)
 
-        if let directory = ProcessInfo.processInfo.environment["CASTMIRROR_SAMPLE_OUT"] {
-            let url = URL(fileURLWithPath: directory).appendingPathComponent("landscape.mp4")
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try chunks.reduce(into: Data()) { all, chunk in
-                switch chunk {
-                case .initSegment(let data), .video(let data, _), .audio(let data): all.append(data)
-                }
-            }.write(to: url)
-        }
+        try saveSample(chunks, as: "landscape.mp4")
     }
 
     /// Turning the phone starts a new init segment at the new size.
@@ -70,8 +78,11 @@ final class StreamTests: XCTestCase {
 
     /// Feeds made-up screen frames and a 44.1 kHz tone through a stream,
     /// faster than real time, switching orientation at equal intervals.
-    private func record(seconds: Int, orientations: [CGImagePropertyOrientation]) throws -> [MirrorStream.Chunk] {
-        let stream = MirrorStream()
+    /// `includeAudio` nil leaves the stream's default.
+    private func record(seconds: Int, orientations: [CGImagePropertyOrientation], includeAudio: Bool? = true) throws -> [MirrorStream.Chunk] {
+        var settings = MirrorStream.Settings()
+        if let includeAudio { settings.includeAudio = includeAudio }
+        let stream = MirrorStream(settings: settings)
         let lock = NSLock()
         var chunks: [MirrorStream.Chunk] = []
         stream.onChunk = { chunk in lock.withLock { chunks.append(chunk) } }
@@ -95,6 +106,18 @@ final class StreamTests: XCTestCase {
         stream.flush()
         stream.stop()
         return lock.withLock { chunks }
+    }
+
+    /// Writes the stream to CASTMIRROR_SAMPLE_OUT, if set.
+    private func saveSample(_ chunks: [MirrorStream.Chunk], as name: String) throws {
+        guard let directory = ProcessInfo.processInfo.environment["CASTMIRROR_SAMPLE_OUT"] else { return }
+        let url = URL(fileURLWithPath: directory).appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try chunks.reduce(into: Data()) { all, chunk in
+            switch chunk {
+            case .initSegment(let data), .video(let data, _), .audio(let data): all.append(data)
+            }
+        }.write(to: url)
     }
 
     private func decodeTime(of fragment: Data) -> UInt64 {

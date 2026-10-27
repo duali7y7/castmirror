@@ -143,6 +143,9 @@ export class FragmentSplitter {
         this.pending = [];
         const info = inspectFragment(frag, this.initInfo);
         chunks.push({ kind: 'fragment', data: frag, keyframe: info.keyframe, hasVideo: info.hasVideo });
+      } else if (type === 'cmau') {
+        // Separate sound (see pcm.js), recorded between fragments.
+        chunks.push({ kind: 'audio', data: this.pending.pop(), keyframe: false, hasVideo: false });
       }
     }
     return chunks;

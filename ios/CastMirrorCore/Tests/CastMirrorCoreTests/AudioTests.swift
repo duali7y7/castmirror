@@ -58,6 +58,48 @@ final class AudioTests: XCTestCase {
         XCTAssertEqual(encoder.nextSample, 28800 + 2000)
     }
 
+    /// Switched on partway through a stream, AAC starts at that time, on a
+    /// whole packet.
+    func testAACStartsPartWay() throws {
+        let encoder = try XCTUnwrap(AudioEncoder(startSample: 100_000))
+        XCTAssertEqual(encoder.nextSample, 97 * 1024)
+        encoder.fillSilence(upTo: 150_000)
+        XCTAssertEqual(encoder.takePackets()?.first, 97)
+    }
+
+    /// Separate sound: 'cmau' chunks of 16-bit stereo, back to back unless
+    /// the timestamps jump.
+    func testPCMChunks() throws {
+        let packer = try XCTUnwrap(PCMPacker())
+        let tone = ToneGenerator(sampleRate: 48000)
+        let first = try XCTUnwrap(packer.chunk(for: tone.next(frames: 1024), startSample: 0))
+        XCTAssertEqual(first.count, 16 + 1024 * 4)
+        XCTAssertEqual(Box.read(first).first?.type, "cmau")
+        XCTAssertEqual(header(first).size, 16 + 4096)
+        XCTAssertEqual(header(first).first, 0)
+        // Left and right of the second frame: 0.3 * sin(2π·440/48000).
+        let expected = Int((0.3 * sin(2 * Double.pi * 440 / 48000) * 32768).rounded())
+        XCTAssertLessThanOrEqual(abs(Int(sample(first, frame: 1, channel: 0)) - expected), 1)
+        XCTAssertEqual(sample(first, frame: 1, channel: 1), sample(first, frame: 1, channel: 0))
+
+        let next = try XCTUnwrap(packer.chunk(for: tone.next(frames: 1024), startSample: 1030))
+        XCTAssertEqual(header(next).first, 1024, "a few samples of timestamp jitter keep it back to back")
+        let jumped = try XCTUnwrap(packer.chunk(for: tone.next(frames: 1024), startSample: 50_000))
+        XCTAssertEqual(header(jumped).first, 50_000)
+    }
+
+    private func header(_ chunk: Data) -> (size: UInt32, first: Int64) {
+        let bytes = [UInt8](chunk.prefix(16))
+        let size = bytes[0..<4].reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        let first = bytes[8..<16].reduce(Int64(0)) { $0 << 8 | Int64($1) }
+        return (size, first)
+    }
+
+    private func sample(_ chunk: Data, frame: Int, channel: Int) -> Int16 {
+        let offset = chunk.startIndex + 16 + frame * 4 + channel * 2
+        return Int16(bitPattern: UInt16(chunk[offset]) | UInt16(chunk[offset + 1]) << 8)
+    }
+
     private func makeSampleBuffer(_ interleaved: [UInt16], sampleRate: Double, flags: AudioFormatFlags) throws -> CMSampleBuffer {
         var asbd = AudioStreamBasicDescription(mSampleRate: sampleRate, mFormatID: kAudioFormatLinearPCM, mFormatFlags: flags,
                                                mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4,

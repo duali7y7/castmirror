@@ -2,7 +2,9 @@
 // Extensions and keeps playback pinned to the newest frame.
 //
 // Media arrives as complete MP4 chunks: one init segment (ftyp+moov), then one
-// moof+mdat fragment per frame. Two transports carry them:
+// moof+mdat fragment per frame. Sound comes either inside that stream or
+// apart from it, as 'cmau' chunks of raw PCM played with Web Audio (see
+// AudioOut). Two transports carry them:
 //   ws   - binary WebSocket frames straight from the sender (lowest overhead)
 //   cast - base64 pieces over the Cast channel, for when the Chromecast blocks
 //          ws:// from an https page
@@ -35,6 +37,9 @@
     targetLag: num(params.get('target'), null),
     jumpLag: num(params.get('jump'), null),
     maxRate: num(params.get('rate'), 1.25),
+    // Separate sound plays this many ms later than the video says (+) or
+    // earlier (-), to line up with the picture on the TV.
+    avOffset: num(params.get('avoffset'), 0) / 1000,
   };
 
   function targetLag() {
@@ -129,6 +134,7 @@
       }
       this.mime = mime;
       this.hasAudio = mime.indexOf('mp4a') >= 0;
+      audioOut.reset();
       this.queue = [init];
       this.sb = null;
       this.started = false;
@@ -212,6 +218,21 @@
       const lag = end - v.currentTime;
       if (settling) {
         if (v.playbackRate !== 1) v.playbackRate = 1;
+      } else if (audioOut.active) {
+        // Separate sound sets the clock, and the picture keeps up with it by
+        // playing a little faster or slower, which can't be seen.
+        const want = audioOut.heardNow() + config.avOffset;
+        const diff = want - v.currentTime;
+        if (Math.abs(diff) > 1 || !inRanges(ranges, v.currentTime)) {
+          if (inRanges(ranges, want)) {
+            this.seek(want, now);
+            v.playbackRate = 1;
+            this.stats.jumps++;
+          }
+        } else {
+          // Gently: the video's clock moves in steps on the Chromecast.
+          v.playbackRate = 1 + Math.max(-0.1, Math.min(0.1, diff));
+        }
       } else if (lag > jumpLag() || !inRanges(ranges, v.currentTime)) {
         this.seek(Math.max(0, end - target), now);
         v.playbackRate = 1;
@@ -235,6 +256,256 @@
       const v = this.video;
       if (!v.buffered.length) return 0;
       return v.buffered.end(v.buffered.length - 1) - v.currentTime;
+    }
+
+    // Media time of the newest frame, or null before any.
+    edge() {
+      const b = this.video.buffered;
+      return b.length ? b.end(b.length - 1) : null;
+    }
+
+    // Whether separate sound can play. It starts only once the video has
+    // caught up after starting or a jump, so the start-up speed-up stays
+    // silent. Once going it carries on through short video stalls, which
+    // the video then makes up.
+    canPlaySound(alreadyPlaying) {
+      const v = this.video;
+      if (!this.started || v.paused) return false;
+      if (alreadyPlaying) return true;
+      if (v.readyState < 3) return false;
+      if (v.currentTime < this.jumpTo + 0.2 && Date.now() - this.jumpedAt < 3000) return false;
+      return this.lag() < targetLag() + 0.3;
+    }
+  }
+
+  // ---------------------------------------------------------------- sound
+
+  const AUDIO_RATE = 48000;
+  const AUDIO_HEADER = 16; // u32 size, 'cmau', u64 first sample
+  // Chunks are handed to Web Audio only this far ahead, so a change in the
+  // video's speed reaches the sound quickly.
+  const AUDIO_HORIZON = 0.15;
+
+  function isAudioChunk(b) {
+    return b.length > AUDIO_HEADER && b[4] === 0x63 && b[5] === 0x6d && b[6] === 0x61 && b[7] === 0x75; // 'cmau'
+  }
+
+  // Plays sound sent apart from the video: 16-bit stereo PCM at 48 kHz, each
+  // chunk stamped with its first sample on the stream's clock, which is the
+  // video's media time. With sound inside the video the Chromecast holds
+  // about 2 s and can't speed up; this way the video stays picture only.
+  //
+  // The sound is the clock, as in most players: chunks play back to back,
+  // and the video follows (Player.tick). The Chromecast's video clock moves
+  // in steps, so the sound chasing the video skipped about once a second.
+  // To stay a safe distance behind the newest sound and picture, the sound
+  // plays up to 1% faster or slower, 3% faster when well behind, and skips
+  // ahead only when far behind or when it runs out.
+  class AudioOut {
+    constructor() {
+      this.ctx = null;
+      this.out = null;
+      this.failed = false;
+      this.active = false;
+      this.queue = [];
+      this.next = 0;      // context time the last scheduled chunk ends
+      this.last = null;   // the last scheduled chunk: { when, start, speed }
+      this.anchor = null; // when starting again: { media, at } to be heard at context time `at`
+      this.edge = 0;      // media time where the newest sound ends
+      this.trail = 0;     // how far sound arrives behind the newest frame (s)
+      this.speed = 1;
+      this.clock = 1;     // context seconds per real second (see trackClock)
+      this.stats = { chunks: 0, played: 0, late: 0, resyncs: 0, skips: 0, waiting: 0 };
+    }
+
+    // Media time being heard now.
+    heardNow() {
+      const last = this.last;
+      return last.start + (this.ctx.currentTime - this.latency() - last.when) * last.speed;
+    }
+
+    // Where the sound should be: a little behind the newest sound, and the
+    // video's target behind the newest frame.
+    safePoint() {
+      const edge = player.edge();
+      return Math.min(this.edge - 0.1, edge === null ? Infinity : edge - targetLag());
+    }
+
+    latency() {
+      return this.ctx ? this.ctx.outputLatency || this.ctx.baseLatency || 0 : 0;
+    }
+
+    open() {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) {
+        this.failed = true;
+        log('no Web Audio, separate sound can\'t play');
+        return false;
+      }
+      // The device's own sample rate: Web Audio converts the 48 kHz chunks.
+      try {
+        this.ctx = new Ctx({ latencyHint: params.get('latency') || 'playback' });
+      } catch (e) {
+        this.ctx = new Ctx();
+      }
+      this.clockStart = { ctx: this.ctx.currentTime, wall: performance.now() };
+      this.clockMark = this.clockStart;
+      this.out = this.ctx.createGain();
+      this.out.connect(this.ctx.destination);
+      if (this.ctx.state === 'suspended' && this.ctx.resume) this.ctx.resume();
+      log('separate sound on, ' + this.ctx.sampleRate + ' Hz, ' + this.ctx.state +
+        ', output latency ' + Math.round(this.latency() * 1000) + ' ms');
+      return true;
+    }
+
+    reset() {
+      this.active = false;
+      this.next = 0;
+      this.last = null;
+      this.anchor = null;
+    }
+
+    // Seconds of sound played per real second since the start; should be 1.
+    clockRate() {
+      const wall = (performance.now() - this.clockStart.wall) / 1000;
+      return wall > 1 ? (this.ctx.currentTime - this.clockStart.ctx) / wall : 1;
+    }
+
+    // The 2015 Chromecast's Web Audio clock runs about 6% slow (even for a
+    // plain oscillator), so sound has to play that much faster to keep real
+    // time. Measured every 2 s and smoothed.
+    trackClock() {
+      const wall = performance.now();
+      const span = (wall - this.clockMark.wall) / 1000;
+      if (span < 2) return;
+      const rate = (this.ctx.currentTime - this.clockMark.ctx) / span;
+      this.clockMark = { ctx: this.ctx.currentTime, wall: wall };
+      if (rate > 0.8 && rate < 1.2) this.clock = this.clock * 0.8 + rate * 0.2;
+    }
+
+    push(bytes) {
+      this.stats.chunks++;
+      if (this.failed || (!this.ctx && !this.open())) return;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const first = view.getUint32(8) * 4294967296 + view.getUint32(12);
+      const frames = (bytes.byteLength - AUDIO_HEADER) >> 2;
+      if (frames <= 0) return;
+      const chunk = {
+        start: first / AUDIO_RATE,
+        duration: frames / AUDIO_RATE,
+        frames: frames,
+        samples: new Int16Array(bytes.buffer, bytes.byteOffset + AUDIO_HEADER, frames * 2),
+      };
+
+      // How far sound arrives behind the picture, for the stats: rises at
+      // once, falls back slowly (about 50 ms a second).
+      const edge = player.edge();
+      if (edge !== null) {
+        this.trail = Math.max(0, edge - (chunk.start + chunk.duration), this.trail - 0.001);
+      }
+      this.edge = chunk.start + chunk.duration;
+      this.queue.push(chunk);
+      this.pump();
+    }
+
+    // Hands queued chunks to Web Audio shortly before they play. Runs on
+    // every chunk and every 20 ms.
+    pump() {
+      if (!this.ctx) return;
+      this.trackClock();
+      if (!player.canPlaySound(this.active)) {
+        if (this.active) log('separate sound paused for the video');
+        this.reset();
+        this.stats.waiting += this.queue.length;
+        this.queue = [];
+        return;
+      }
+      const now = this.ctx.currentTime;
+      // Real time, in the context's slower seconds.
+      const realTime = 1 / Math.max(0.9, Math.min(1.1, this.clock));
+      if (this.next) {
+        const safe = this.safePoint();
+        const behind = safe - this.heardNow();
+        if (this.next < now || behind > 0.8) {
+          // Ran out of sound, or far behind live: start again from the safe point.
+          if (this.next < now) this.stats.resyncs++;
+          else this.stats.skips++;
+          this.next = 0;
+          this.anchor = { media: safe, at: now };
+          this.speed = realTime;
+        } else if (behind > 0.2) {
+          this.speed = realTime * 1.03;
+        } else {
+          this.speed = realTime * (1 + Math.max(-0.01, Math.min(0.01, behind * 0.05)));
+        }
+      }
+      if (!this.next && !this.anchor) {
+        // Start in step with the video, or at the safe point if that's
+        // further back (sound arriving after the picture).
+        this.anchor = { media: Math.min(els.video.currentTime - config.avOffset, this.safePoint()), at: now };
+        this.speed = realTime;
+      }
+      while (this.queue.length) {
+        const chunk = this.queue[0];
+        // Heard `latency` after it's scheduled, so the anchor's media time is
+        // heard at the anchor's time.
+        const when = this.next || this.anchor.at + (chunk.start - this.anchor.media) / this.speed - this.latency();
+        if (when > now + AUDIO_HORIZON) break;
+        // Up to 100 ms of back-to-back chunks go out as one buffer: the 2015
+        // Chromecast can't keep up with 50 small ones a second.
+        const group = [this.queue.shift()];
+        let frames = chunk.frames;
+        while (this.queue.length && frames + this.queue[0].frames <= AUDIO_RATE / 10 &&
+               Math.abs(this.queue[0].start - (chunk.start + frames / AUDIO_RATE)) < 0.0005) {
+          frames += this.queue[0].frames;
+          group.push(this.queue.shift());
+        }
+        if (when + frames / AUDIO_RATE / this.speed < now + 0.005) {
+          this.stats.late += group.length;
+          continue;
+        }
+        if (!this.active) log('separate sound playing');
+        this.active = true;
+        this.play(group, frames, when, this.speed, now);
+        this.last = { when: when, start: chunk.start, speed: this.speed };
+        this.next = when + frames / AUDIO_RATE / this.speed;
+        this.anchor = null;
+      }
+    }
+
+    play(group, frames, when, speed, now) {
+      const buffer = this.ctx.createBuffer(2, frames, AUDIO_RATE);
+      const left = buffer.getChannelData(0);
+      const right = buffer.getChannelData(1);
+      let at = 0;
+      for (let c = 0; c < group.length; c++) {
+        const samples = group[c].samples;
+        const n = group[c].frames;
+        for (let i = 0; i < n; i++) {
+          left[at + i] = samples[2 * i] / 32768;
+          right[at + i] = samples[2 * i + 1] / 32768;
+        }
+        at += n;
+      }
+      const source = this.ctx.createBufferSource();
+      source.buffer = buffer;
+      if (speed !== 1) source.playbackRate.value = speed;
+      source.connect(this.out);
+      const start = Math.max(when, now);
+      source.start(start, (start - when) * speed);
+      this.stats.played += group.length;
+    }
+
+    summary() {
+      if (!this.stats.chunks) return null;
+      const edge = player.edge();
+      const behind = this.active && edge !== null ? Math.round((edge - this.heardNow()) * 1000) + ' ms' : '-';
+      return 'played ' + this.stats.played + '/' + this.stats.chunks + ', late ' + this.stats.late +
+        ', waiting ' + this.stats.waiting + ', ran out ' + this.stats.resyncs + ', skips ' + this.stats.skips +
+        ', speed ' + this.speed.toFixed(3) + ', behind newest frame ' + behind +
+        ', arrives ' + Math.round(this.trail * 1000) + ' ms after the picture' +
+        (this.ctx ? ', ' + this.ctx.state + ' at ' + this.ctx.sampleRate + ' Hz, clock ' + this.clock.toFixed(3) +
+          'x (' + this.clockRate().toFixed(3) + 'x since start), out ' + Math.round(this.latency() * 1000) + ' ms' : '');
     }
   }
 
@@ -279,6 +550,12 @@
   }
 
   const player = new Player(els.video);
+  const audioOut = new AudioOut();
+
+  function pushMedia(bytes) {
+    if (isAudioChunk(bytes)) audioOut.push(bytes);
+    else player.push(bytes);
+  }
 
   // ---------------------------------------------------------------- transports
 
@@ -287,6 +564,7 @@
   let transport = 'none';
   let rtt = -1;
   let castPieces = [];
+  let phoneLine = '';
   let wsUrl = '';
   let wsGeneration = 0;
 
@@ -317,7 +595,7 @@
         if (msg.e) {
           const joined = castPieces.join('');
           castPieces = [];
-          player.push(base64ToBytes(joined));
+          pushMedia(base64ToBytes(joined));
         }
         break;
       case 'pong':
@@ -325,6 +603,9 @@
         break;
       case 'overlay':
         els.overlay.hidden = !msg.show;
+        break;
+      case 'phone': // the phone's own figures, shown in the overlay
+        phoneLine = String(msg.text || '');
         break;
       case 'log':
         log('sender: ' + msg.msg, false);
@@ -365,7 +646,7 @@
       if (typeof e.data === 'string') {
         try { handleControl(JSON.parse(e.data)); } catch (err) { /* ignore bad json */ }
       } else {
-        player.push(new Uint8Array(e.data));
+        pushMedia(new Uint8Array(e.data));
       }
     };
     sock.onclose = () => {
@@ -449,6 +730,7 @@
       ready: els.video.readyState,
       paused: els.video.paused,
       audio: !player.hasAudio ? 'none' : els.video.muted ? 'muted' : 'vol ' + Math.round(els.video.volume * 100),
+      sound: audioOut.summary(),
       rate: Math.round(els.video.playbackRate * 100) / 100,
       queue: player.queue.length,
       maxQueue: player.stats.maxQueue,
@@ -473,6 +755,8 @@
           '   queue ' + s.queue + ' (max ' + s.maxQueue + ')\n' +
         'playback  ' + s.play + 'x   ready ' + s.ready + (s.paused ? '   paused' : '') +
           '   audio ' + s.audio + '\n' +
+        (s.sound ? 'sound     ' + s.sound + '\n' : '') +
+        (phoneLine ? 'phone     ' + phoneLine + '\n' : '') +
         'events    jumps ' + s.jumps + '   stalls ' + s.stalls + '\n\n' +
         logLines.join('\n');
     }
@@ -483,6 +767,7 @@
   }, 1000);
 
   setInterval(() => player.tick(), 100);
+  setInterval(() => audioOut.pump(), 20);
 
   // ---------------------------------------------------------------- start
 

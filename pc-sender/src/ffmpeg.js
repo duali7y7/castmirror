@@ -31,6 +31,15 @@ export function buildFfmpegArgs(opts) {
     }
   } else if (source === 'test') {
     args.push('-re', '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps}`);
+  } else if (source === 'synctest') {
+    // The picture flashes white and a beep sounds for the first 100 ms of
+    // every second, to check sound and picture line up on the TV.
+    args.push('-re', '-f', 'lavfi', '-i', `testsrc2=size=${width}x${height}:rate=${fps},`
+      + `drawbox=w=iw:h=ih:color=white:t=fill:enable='lt(mod(t,1),0.1)'`);
+    // 10 ms frames, so the beep starts and stops on time.
+    args.push('-re', '-f', 'lavfi', '-i', 'sine=frequency=1000:sample_rate=48000:samples_per_frame=480,'
+      + `volume=volume='if(lt(mod(t,1),0.1),4,0)':eval=frame`);
+    audioInput = 1;
   } else if (source === 'file') {
     if (!opts.file) throw new Error('--source file needs --file <path>');
     args.push('-re', '-stream_loop', '-1', '-i', opts.file);
@@ -38,14 +47,17 @@ export function buildFfmpegArgs(opts) {
     throw new Error('unknown source ' + source);
   }
 
-  if (opts.audio && source !== 'file') {
+  if (opts.audio && source !== 'file' && audioInput < 0) {
     args.push('-re', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000');
     audioInput = 1;
   }
+  const audioMap = source === 'file' ? '0:a:0?' : audioInput >= 0 ? `${audioInput}:a:0` : null;
+  // With separate sound (opts.pcmUrl) the MP4 is picture only and the sound
+  // goes to a second output as raw PCM.
+  const audioInMp4 = audioMap && !opts.pcmUrl;
 
   args.push('-map', '0:v:0');
-  if (source === 'file') args.push('-map', '0:a:0?');
-  else if (audioInput >= 0) args.push('-map', `${audioInput}:a:0`);
+  if (audioInMp4) args.push('-map', audioMap);
 
   const pixFmt = opts.encoder === 'qsv' ? 'nv12' : 'yuv420p';
   args.push('-vf', [
@@ -65,7 +77,7 @@ export function buildFfmpegArgs(opts) {
       '-profile:v', 'high', '-level:v', '4.1', '-bf', '0', '-g', String(gop), ...rate);
   }
 
-  if (source === 'file' || audioInput >= 0) {
+  if (audioInMp4) {
     args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
   }
 
@@ -79,6 +91,10 @@ export function buildFfmpegArgs(opts) {
     '-flush_packets', '1',
     'pipe:1',
   );
+  if (audioMap && opts.pcmUrl) {
+    args.push('-map', audioMap, '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2',
+      '-f', 's16le', '-flush_packets', '1', opts.pcmUrl);
+  }
   return args;
 }
 

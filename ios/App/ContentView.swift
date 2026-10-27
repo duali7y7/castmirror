@@ -8,7 +8,8 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var finder = ChromecastFinder()
     @StateObject private var relay = SettingsRelay()
-    @AppStorage(SettingsRelay.showStatsKey) private var showStats = false
+    @AppStorage(MirrorOptions.showStatsKey) private var showStats = false
+    @AppStorage(MirrorOptions.soundKey) private var sound = SoundMode.phone
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -33,6 +34,22 @@ struct ContentView: View {
                         .disabled(finder.searching)
                 }
 
+                Section {
+                    Picker("Sound", selection: $sound) {
+                        SoundChoice(title: "iPhone", detail: "TV picture about 0.5 s behind the phone's sound.")
+                            .tag(SoundMode.phone)
+                        SoundChoice(title: "TV, low delay", detail: "Sound sent beside the picture, about 0.5 s behind. New, still being tested.")
+                            .tag(SoundMode.tv)
+                        SoundChoice(title: "TV, steady", detail: "Sound inside the video, about 2 s behind.")
+                            .tag(SoundMode.tvInVideo)
+                    }
+                    .pickerStyle(.inline)
+                } header: {
+                    Text("Sound")
+                } footer: {
+                    Text("With sound on the TV, turn the phone's volume down. Changes apply straight away while mirroring.")
+                }
+
                 Section("2. Start mirroring") {
                     HStack(spacing: 16) {
                         BroadcastButton()
@@ -45,7 +62,9 @@ struct ContentView: View {
                 }
 
                 Section("3. Watch") {
-                    Text("Open your video app. The picture shows on the TV about half a second behind the phone. Sound plays from the phone.")
+                    Text(sound == .phone
+                         ? "Open your video app. The picture shows on the TV about half a second behind the phone. Sound plays from the phone."
+                         : "Open your video app. Picture and sound play on the TV, in step with each other.")
                     Text("To stop, tap the red recording indicator at the top of the screen.")
                         .foregroundStyle(.secondary)
                 }
@@ -62,9 +81,22 @@ struct ContentView: View {
             finder.search()
             relay.start()
         }
-        .onChange(of: showStats) { _, show in OptionsChannel.post(showStats: show) }
+        .onChange(of: showStats) { _, _ in relay.send() }
+        .onChange(of: sound) { _, _ in relay.send() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { relay.send() }
+        }
+    }
+}
+
+struct SoundChoice: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+            Text(detail).font(.caption).foregroundStyle(.secondary)
         }
     }
 }
@@ -73,8 +105,6 @@ struct ContentView: View {
 /// them itself: on each change, when the app comes back, and when a
 /// broadcast starts (the app is still open behind the broadcast sheet then).
 final class SettingsRelay: ObservableObject {
-    static let showStatsKey = "showStats"
-
     private var observation: OptionsChannel.Observation?
 
     func start() {
@@ -83,7 +113,7 @@ final class SettingsRelay: ObservableObject {
     }
 
     func send() {
-        OptionsChannel.post(showStats: UserDefaults.standard.bool(forKey: Self.showStatsKey))
+        OptionsChannel.post(MirrorOptions(defaults: .standard))
     }
 }
 

@@ -19,10 +19,9 @@ final class StreamTests: XCTestCase {
     /// `landscape-video.mp4` for replaying on a Chromecast, like the
     /// landscape test below.
     func testNoSoundByDefault() throws {
-        let chunks = try record(seconds: 10, orientations: [.right], includeAudio: nil)
+        let chunks = try record(seconds: 10, orientations: [.right], sounds: nil)
         guard case .initSegment(let segment) = chunks.first else { return XCTFail("stream must start with the init segment") }
-        let tracks = Box.read(segment).last?.children.filter { $0.type == "trak" } ?? []
-        XCTAssertEqual(tracks.count, 1)
+        XCTAssertEqual(trackCount(segment), 1)
         XCTAssertFalse(chunks.contains { if case .audio = $0 { return true } else { return false } })
         XCTAssertGreaterThanOrEqual(chunks.count, 286)
         // Without the AAC start-up delay, video starts at zero.
@@ -36,7 +35,7 @@ final class StreamTests: XCTestCase {
     /// checked with FFmpeg and played on a Chromecast with
     /// `npm start -- --source replay --file landscape.mp4`.
     func testLandscapeStreamWithSound() throws {
-        let chunks = try record(seconds: 10, orientations: [.right], includeAudio: true)
+        let chunks = try record(seconds: 10, orientations: [.right], sounds: [.tvInVideo])
         let inits = chunks.filter { if case .initSegment = $0 { return true } else { return false } }
         XCTAssertEqual(inits.count, 1)
         guard case .initSegment(let segment) = chunks.first else { return XCTFail("stream must start with the init segment") }
@@ -76,12 +75,70 @@ final class StreamTests: XCTestCase {
         XCTAssertEqual(sizes, [[498, 1080], [1920, 886]])
     }
 
+    /// "TV, low delay": picture-only MP4 plus 'cmau' PCM chunks, back to
+    /// back. Saved as `landscape-tv.mp4`, which the PC sender's replay plays
+    /// on the Chromecast with its sound.
+    func testSeparateSound() throws {
+        let chunks = try record(seconds: 10, orientations: [.right], sounds: [.tv])
+        guard case .initSegment(let segment) = chunks.first else { return XCTFail("stream must start with the init segment") }
+        XCTAssertEqual(trackCount(segment), 1)
+
+        let sound = pcmChunks(chunks)
+        XCTAssertEqual(sound.count, chunks.filter { if case .audio = $0 { return true } else { return false } }.count,
+                       "all sound comes as cmau chunks")
+        XCTAssertGreaterThan(sound.count, 400)
+        for (previous, chunk) in zip(sound, sound.dropFirst()) {
+            XCTAssertEqual(chunk.first, previous.first + Int64(previous.frames), "chunks follow each other exactly")
+        }
+        let total = sound.reduce(0) { $0 + $1.frames }
+        XCTAssertEqual(Double(total) / 48000, 10, accuracy: 0.3)
+        try saveSample(chunks, as: "landscape-tv.mp4")
+    }
+
+    /// The sound setting changes while streaming: iPhone, then sound inside
+    /// the video, then sound beside it, each starting from the time of the switch.
+    func testSwitchingSoundWhileStreaming() throws {
+        let chunks = try record(seconds: 6, orientations: [.right], sounds: [.phone, .tvInVideo, .tv])
+        let inits = chunks.enumerated().compactMap { index, chunk -> (Int, Data)? in
+            if case .initSegment(let data) = chunk { return (index, data) } else { return nil }
+        }
+        XCTAssertEqual(inits.map { trackCount($0.1) }, [1, 2, 1])
+        guard inits.count == 3 else { return }
+
+        let aac = chunks.enumerated().compactMap { index, chunk -> (Int, UInt64)? in
+            guard case .audio(let data) = chunk, Box.read(data).first?.type == "moof" else { return nil }
+            return (index, decodeTime(of: data))
+        }
+        XCTAssertTrue(aac.allSatisfy { $0.0 > inits[1].0 && $0.0 < inits[2].0 }, "AAC only while it's switched on")
+        // Switched on at 2 s: AAC starts there, not at the stream's start.
+        XCTAssertEqual(Double(aac.first?.1 ?? 0) / 48000, 2, accuracy: 0.25)
+
+        let pcmIndexes = chunks.indices.filter { index in
+            if case .audio(let data) = chunks[index] { return Box.read(data).first?.type == "cmau" } else { return false }
+        }
+        XCTAssertTrue(pcmIndexes.allSatisfy { $0 > inits[2].0 }, "separate sound only after switching to it")
+        XCTAssertEqual(Double(pcmChunks(chunks).first?.first ?? 0) / 48000, 4, accuracy: 0.25)
+    }
+
+    /// App audio that arrives 0.6 s after its timestamps still plays: the
+    /// silence that fills gaps waits for it instead of taking its place.
+    func testLateAppAudioIsNotReplacedBySilence() throws {
+        var dropped = 0.0
+        _ = try record(seconds: 4, orientations: [.right], sounds: [.tvInVideo], audioDelay: 0.6) { stream in
+            dropped = stream.droppedAudioSeconds
+        }
+        // Only the start is lost, while the stream learns how late it comes.
+        XCTAssertLessThan(dropped, 0.5)
+    }
+
     /// Feeds made-up screen frames and a 44.1 kHz tone through a stream,
-    /// faster than real time, switching orientation at equal intervals.
-    /// `includeAudio` nil leaves the stream's default.
-    private func record(seconds: Int, orientations: [CGImagePropertyOrientation], includeAudio: Bool? = true) throws -> [MirrorStream.Chunk] {
+    /// faster than real time, switching orientation and sound at equal
+    /// intervals. `sounds` nil leaves the stream's default. The tone arrives
+    /// `audioDelay` seconds after its timestamps.
+    private func record(seconds: Int, orientations: [CGImagePropertyOrientation], sounds: [SoundMode]? = [.tvInVideo],
+                        audioDelay: Double = 0, inspect: ((MirrorStream) -> Void)? = nil) throws -> [MirrorStream.Chunk] {
         var settings = MirrorStream.Settings()
-        if let includeAudio { settings.includeAudio = includeAudio }
+        if let sound = sounds?.first { settings.sound = sound }
         let stream = MirrorStream(settings: settings)
         let lock = NSLock()
         var chunks: [MirrorStream.Chunk] = []
@@ -92,20 +149,39 @@ final class StreamTests: XCTestCase {
         let origin = 5000.0
         let frames = seconds * 30
         var audioTime = 0.0
+        var sound = sounds?.first
         for i in 0..<frames {
             let time = Double(i) / 30
             let orientation = orientations[i * orientations.count / frames]
+            if let sounds, sounds[i * sounds.count / frames] != sound {
+                sound = sounds[i * sounds.count / frames]
+                stream.setSound(sound!)
+            }
             stream.submitVideo(screen.frame(i), orientation: orientation)
             stream.tick(hostTime: origin + time)
-            while audioTime < time + 1.0 / 30 {
+            while audioTime < time + 1.0 / 30 - audioDelay {
                 stream.submitAudio(tone.next(frames: 1024), hostTime: origin + audioTime)
                 audioTime += 1024 / 44100
             }
             if i % 30 == 29 { stream.flush() }  // keep the real-time encoder from falling behind
         }
         stream.flush()
+        inspect?(stream)
         stream.stop()
         return lock.withLock { chunks }
+    }
+
+    private func trackCount(_ initSegment: Data) -> Int {
+        Box.read(initSegment).last?.children.filter { $0.type == "trak" }.count ?? 0
+    }
+
+    /// The 'cmau' chunks in a stream: first sample and number of frames.
+    private func pcmChunks(_ chunks: [MirrorStream.Chunk]) -> [(first: Int64, frames: Int)] {
+        chunks.compactMap { chunk in
+            guard case .audio(let data) = chunk, let box = Box.read(data).first, box.type == "cmau" else { return nil }
+            let first = Int64(box.u32(at: 0)) << 32 | Int64(box.u32(at: 4))
+            return (first, (box.body.count - 8) / 4)
+        }
     }
 
     /// Writes the stream to CASTMIRROR_SAMPLE_OUT, if set.

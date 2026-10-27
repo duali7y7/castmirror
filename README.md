@@ -19,7 +19,8 @@ Low-delay mirroring of an iPhone screen and sound to a 2nd-gen (2015) Chromecast
 - [x] Receiver tested on the Chromecast, through DashCast
 - [x] Delay measured: 1.93 s with sound, in sync (see `docs/phase1-results.md`)
 - [x] iPhone app: mirrors to the TV (first test on an iPhone 15, iOS 27)
-- [ ] v1: picture only, lower delay, upright landscape, stats switch (built, to test on the phone)
+- [x] v1: picture only, lower delay (about 0.5 s), upright landscape, stats switch
+- [ ] Sound on the TV: "low delay" and "steady" modes (built, to test on the phone)
 - [ ] Own Cast app ID (optional while DashCast works)
 
 ## One-time setup
@@ -65,6 +66,12 @@ npm start -- --audio --target 300
 ```
 
 ```bash
+npm start -- --source synctest --sound pcm
+```
+
+That one flashes the screen white with a beep at the start of every second, with the sound sent separately (as "TV, low delay"), to check sound and picture line up. `--avoffset <ms>` shifts the sound later (+) or earlier (-).
+
+```bash
 npm start -- --source file --file "C:\path\to\video.mp4"
 ```
 
@@ -94,8 +101,15 @@ Each install:
 Using it:
 1. Open **CastMirror**. It searches for Chromecasts. Allow **Local Network** access when iOS asks; the broadcast needs it.
 2. Tap the round button, then **Start Broadcast**. (Or long-press **Screen Recording** in Control Center and pick CastMirror.)
-3. The TV switches to CastMirror. Open your video app. The picture reaches the TV about half a second after the phone. Sound plays from the phone: with sound in the stream, the Chromecast holds about 2 s of it and can't catch up (see `docs/phase1-results.md`), so v1 sends picture only.
+3. The TV switches to CastMirror. Open your video app. The picture reaches the TV about half a second after the phone.
 4. To stop, tap the red indicator at the top of the screen and **Stop**.
+
+**Sound** (in the app, applies straight away while mirroring):
+- **iPhone**: the TV gets picture only, and sound plays from the phone, about half a second ahead of the TV.
+- **TV, low delay** (new): the sound goes beside the picture as raw PCM, and the TV page plays it with Web Audio and keeps the picture in step with it. About the same delay as picture only. The 2015 Chromecast's Web Audio clock runs about 6% slow, which the page measures and makes up for.
+- **TV, steady**: the sound goes inside the video stream. It's proven, but the Chromecast then holds about 2 s and can't catch up (see `docs/phase1-results.md`).
+
+With sound on the TV, turn the phone's volume down; the phone always plays its own sound too. Apple Music and some other apps block their sound from screen capture.
 
 Tips:
 - **Show stats on the TV** in the app puts frame rate, buffer and network figures over the picture. It applies straight away while mirroring.

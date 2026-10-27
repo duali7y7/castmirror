@@ -13,12 +13,14 @@ export function dashcastLoadMessage(url) {
 }
 
 // The receiver page address, carrying the settings that the hello message
-// would otherwise send over the Cast channel. target and jump are seconds.
-export function receiverPageUrl(base, { ws, debug, target, jump }) {
+// would otherwise send over the Cast channel. target and jump are seconds;
+// avOffset is milliseconds.
+export function receiverPageUrl(base, { ws, debug, target, jump, avOffset }) {
   const url = new URL(base);
   url.searchParams.set('ws', ws);
   if (!debug) url.searchParams.set('debug', '0');
   if (target !== undefined) url.searchParams.set('target', String(target));
   if (jump !== undefined) url.searchParams.set('jump', String(jump));
+  if (avOffset !== undefined) url.searchParams.set('avoffset', String(avOffset));
   return url.toString();
 }

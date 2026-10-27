@@ -32,18 +32,25 @@ public final class MirrorSession: @unchecked Sendable {
     private var stopped = false
     private var showStats: Bool
 
-    public init(receiverDirectory: URL?, settings: MirrorStream.Settings = .init(), showStats: Bool = false) {
+    public init(receiverDirectory: URL?, settings: MirrorStream.Settings = .init(), options: MirrorOptions = .init()) {
+        var settings = settings
+        settings.sound = options.sound
         stream = MirrorStream(settings: settings)
         http = HTTPServer(receiverDirectory: receiverDirectory)
         // About 0.3 s of video.
         backlogLimit = max(256 * 1024, settings.bitrate / 8 * 3 / 10)
-        self.showStats = showStats
+        showStats = options.showStats
     }
 
     /// Shows or hides the stats overlay on the TV, straight away if it's connected.
     public func setShowStats(_ show: Bool) {
         lock.withLock { showStats = show }
         sendJSON(["type": "overlay", "show": show])
+    }
+
+    /// Changes where the sound plays, straight away.
+    public func setSound(_ sound: SoundMode) {
+        stream.setSound(sound)
     }
 
     public func start() {
@@ -72,7 +79,7 @@ public final class MirrorSession: @unchecked Sendable {
     }
 
     public func handleAudio(_ sample: CMSampleBuffer) {
-        guard let pcm = AudioSamples.pcmBuffer(from: sample) else { return }
+        guard stream.wantsAudio, let pcm = AudioSamples.pcmBuffer(from: sample) else { return }
         stream.submitAudio(pcm, hostTime: CMSampleBufferGetPresentationTimeStamp(sample).seconds)
     }
 
@@ -194,6 +201,12 @@ public final class MirrorSession: @unchecked Sendable {
             Log.shared.info("tv: \(s["res"] ?? "?") @ \(s["fps"] ?? "?") fps, plays \(s["play"] ?? "?")x, "
                 + "buffer \(s["lagMs"] ?? "?") ms, rtt \(s["rttMs"] ?? "?") ms, \(s["mbps"] ?? "?") Mbps, "
                 + "jumps \(s["jumps"] ?? "?"), stalls \(s["stalls"] ?? "?"), phone dropped \(dropped)", forward: false)
+            if let sound = s["sound"] as? String { Log.shared.info("tv: sound \(sound)", forward: false) }
+            // The phone's side of the sound, for the TV's stats overlay too.
+            if let audio = stream.audioSummary() {
+                Log.shared.info(audio, forward: false)
+                sendJSON(["type": "phone", "text": audio])
+            }
         default:
             break
         }

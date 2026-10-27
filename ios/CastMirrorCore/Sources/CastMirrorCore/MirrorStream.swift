@@ -4,9 +4,10 @@ import CoreVideo
 import Foundation
 import ImageIO
 
-/// Turns screen frames (and app audio, if included) into the fragmented MP4
-/// chunks the receiver plays: an init segment, then one fragment per video
-/// frame and one per batch of audio packets.
+/// Turns screen frames and app audio into the chunks the receiver plays: an
+/// MP4 init segment, then one fragment per video frame, with the sound as
+/// the SoundMode says: none, AAC fragments inside the MP4 stream, or PCM
+/// chunks apart from it.
 ///
 /// Frames go out at a fixed rate: ReplayKit only delivers a frame when the
 /// screen changes, so on each tick the newest frame is encoded again if
@@ -18,9 +19,8 @@ public final class MirrorStream: @unchecked Sendable {
         public var bitrate = 6_000_000
         public var maxWidth = 1920
         public var maxHeight = 1080
-        /// With sound, the Chromecast holds about 2 s of stream and can't
-        /// catch up; without, about 0.35 s. So the sound stays on the phone.
-        public var includeAudio = false
+        /// Where the sound plays at the start; setSound(_:) changes it.
+        public var sound = SoundMode.phone
 
         public init() {}
     }
@@ -34,14 +34,22 @@ public final class MirrorStream: @unchecked Sendable {
     /// Called on the stream's queue, in order.
     public var onChunk: ((Chunk) -> Void)?
 
+    /// Video timestamps move later by the AAC encoder's start-up delay when
+    /// the stream carries AAC, so sound and picture line up.
+    private static let aacVideoOffset = UInt64(AudioEncoder.primingSamples) * UInt64(FMP4.videoTimescale) / UInt64(AudioEncoder.sampleRate)
+
     private let queue = DispatchQueue(label: "castmirror.stream", qos: .userInteractive)
     private let settings: Settings
     private let video: VideoEncoder
-    private let audio: AudioEncoder?
-    /// Video timestamps move later by the AAC encoder's start-up delay, so
-    /// sound and picture line up.
-    private let videoOffset: UInt64
+    private let soundLock = NSLock()
+    private var wantedSound: SoundMode  // under soundLock: ReplayKit's thread reads it
+    private var sound: SoundMode        // on the queue
+    private var aac: AudioEncoder?
+    private var pcm: PCMPacker?
+    private var initSound: SoundMode?
+    private var initHasAAC = false
     private var origin: Double?
+    private var elapsed = 0.0
     private var latest: (buffer: CVPixelBuffer, orientation: CGImagePropertyOrientation)?
     private var prepared: CVPixelBuffer?
     private var lastIndex: Int64 = -1
@@ -49,14 +57,26 @@ public final class MirrorStream: @unchecked Sendable {
     private var initSegment: Data?
     private var sequence: UInt32 = 0
     private var clock: DispatchSourceTimer?
+    /// How late app audio arrives after its timestamp (s): rises at once,
+    /// falls slowly. Silence waits that long before taking its place.
+    private var audioLag = 0.0
+    private var audioStats = AudioStats()
+    private var droppedReported: Int64 = 0
+
+    private struct AudioStats {
+        var buffers = 0
+        var seconds = 0.0
+        var peak: Float = 0
+        var latest = -Double.infinity
+    }
 
     public init(settings: Settings = Settings()) {
         self.settings = settings
+        wantedSound = settings.sound
+        sound = settings.sound
         video = VideoEncoder(settings: .init(maxWidth: settings.maxWidth, maxHeight: settings.maxHeight,
                                              fps: settings.fps, bitrate: settings.bitrate, keyframeInterval: settings.fps * 2))
-        audio = settings.includeAudio ? AudioEncoder() : nil
-        if settings.includeAudio && audio == nil { logInfo("audio: no AAC encoder, sending video only") }
-        videoOffset = audio == nil ? 0 : UInt64(AudioEncoder.primingSamples) * UInt64(FMP4.videoTimescale) / UInt64(AudioEncoder.sampleRate)
+        startSound()
         video.onFrame = { [weak self] frame in
             self?.queue.async { self?.emitVideo(frame) }
         }
@@ -67,13 +87,45 @@ public final class MirrorStream: @unchecked Sendable {
         queue.async { self.latest = (buffer, orientation) }
     }
 
+    /// Whether app audio is used at all, to skip converting it otherwise.
+    /// Safe from any thread.
+    public var wantsAudio: Bool {
+        soundLock.withLock { wantedSound != .phone }
+    }
+
     /// Hands over app audio whose first sample played at `hostTime` seconds.
     /// Safe from any thread.
     public func submitAudio(_ buffer: AVAudioPCMBuffer, hostTime: Double) {
         queue.async {
-            guard let audio = self.audio, let origin = self.origin else { return }
+            guard let origin = self.origin, self.aac != nil || self.pcm != nil else { return }
             let start = Int64(((hostTime - origin) * Double(AudioEncoder.sampleRate)).rounded())
-            audio.append(buffer, startSample: start)
+            let duration = Double(buffer.frameLength) / buffer.format.sampleRate
+            let lateness = self.elapsed - (hostTime - origin + duration)
+            self.audioLag = max(self.audioLag, min(1.2, lateness))
+            self.audioStats.buffers += 1
+            self.audioStats.seconds += duration
+            self.audioStats.peak = max(self.audioStats.peak, Self.peak(of: buffer))
+            self.audioStats.latest = max(self.audioStats.latest, lateness)
+
+            self.aac?.append(buffer, startSample: start)
+            // Separate sound once the stream it goes with has started.
+            if let pcm = self.pcm, self.initSound == .tv, let chunk = pcm.chunk(for: buffer, startSample: start) {
+                self.onChunk?(.audio(chunk))
+            }
+        }
+    }
+
+    /// Changes where the sound plays, while streaming. Sound inside the video
+    /// stream switches on or off with a new init segment at the next
+    /// keyframe, which makes the receiver start a fresh stream.
+    public func setSound(_ mode: SoundMode) {
+        soundLock.withLock { wantedSound = mode }
+        queue.async {
+            guard mode != self.sound else { return }
+            self.sound = mode
+            logInfo("sound: \(mode.rawValue)")
+            self.startSound()
+            self.video.requestKeyframe()
         }
     }
 
@@ -105,6 +157,33 @@ public final class MirrorStream: @unchecked Sendable {
         queue.sync { initSegment }
     }
 
+    /// What app audio did since the last call, for the logs; nil while the
+    /// sound stays on the phone. Don't call from `onChunk`.
+    public func audioSummary() -> String? {
+        queue.sync {
+            guard sound != .phone else { return nil }
+            let stats = audioStats
+            audioStats = AudioStats()
+            guard stats.buffers > 0 else {
+                return "sound \(sound.rawValue): no app audio (Apple Music and some other apps block capture)"
+            }
+            let peak = stats.peak > 0 ? String(format: "peak %.0f dB", 20 * log10(stats.peak)) : "silent"
+            var text = String(format: "sound %@: %.1f s from apps, %@, up to %.0f ms late", sound.rawValue, stats.seconds, peak,
+                              max(0, stats.latest) * 1000)
+            if let aac {
+                let dropped = aac.droppedSamples - droppedReported
+                droppedReported = aac.droppedSamples
+                text += String(format: ", %.1f s dropped as late", Double(dropped) / Double(AudioEncoder.sampleRate))
+            }
+            return text
+        }
+    }
+
+    /// App audio dropped as late so far in "TV, steady", for the tests.
+    var droppedAudioSeconds: Double {
+        queue.sync { Double(aac?.droppedSamples ?? 0) / Double(AudioEncoder.sampleRate) }
+    }
+
     /// Waits until everything submitted so far has come out as chunks.
     public func flush() {
         queue.sync { video.flush() }
@@ -121,9 +200,18 @@ public final class MirrorStream: @unchecked Sendable {
 
     // MARK: - On the queue
 
+    /// Sets up the encoder for `sound`, starting from the current time.
+    private func startSound() {
+        let now = Int64(elapsed * Double(AudioEncoder.sampleRate))
+        aac = sound == .tvInVideo ? AudioEncoder(startSample: now) : nil
+        if sound == .tvInVideo && aac == nil { logInfo("audio: no AAC encoder, sending video only") }
+        pcm = sound == .tv ? PCMPacker() : nil
+        droppedReported = 0
+    }
+
     private func step(now: Double) {
         if origin == nil { origin = now }
-        let elapsed = now - (origin ?? now)
+        elapsed = now - (origin ?? now)
         let index = Int64((elapsed * Double(settings.fps)).rounded())
         guard index > lastIndex else { return }
         lastIndex = index
@@ -135,35 +223,40 @@ public final class MirrorStream: @unchecked Sendable {
         }
         if let prepared { video.encode(prepared, index: index) }
 
-        if let audio {
-            // Silence once app audio is more than 0.3 s behind (nothing playing).
-            audio.fillSilence(upTo: Int64((elapsed - 0.3) * Double(AudioEncoder.sampleRate)))
+        audioLag = max(0, audioLag - 0.02 / Double(settings.fps))  // 20 ms a second
+        if let aac {
+            // Silence once app audio is well behind (nothing playing). Late
+            // app audio must get there first, or the silence replaces it.
+            let wait = max(0.3, min(1.5, audioLag + 0.15))
+            aac.fillSilence(upTo: Int64((elapsed - wait) * Double(AudioEncoder.sampleRate)))
             emitAudio()
         }
     }
 
     private func emitVideo(_ frame: VideoEncoder.Frame) {
-        if frame.config != videoConfig {
-            // A new size always starts with a keyframe.
-            guard frame.isKeyframe else { return }
+        if (frame.config != videoConfig || initSound != sound) && frame.isKeyframe {
             videoConfig = frame.config
-            let segment = FMP4.initSegment(video: frame.config, audio: audio?.config)
+            initSound = sound
+            initHasAAC = aac != nil
+            let segment = FMP4.initSegment(video: frame.config, audio: initHasAAC ? aac?.config : nil)
             initSegment = segment
             onChunk?(.initSegment(segment))
+        } else if frame.config != videoConfig {
+            return  // a new size starts with its keyframe
         }
         let frameTicks = UInt64(FMP4.videoTimescale) / UInt64(settings.fps)
         sequence += 1
         let fragment = FMP4.fragment(
             sequence: sequence, track: FMP4.videoTrack,
-            baseDecodeTime: UInt64(max(0, frame.index)) * frameTicks + videoOffset,
+            baseDecodeTime: UInt64(max(0, frame.index)) * frameTicks + (initHasAAC ? Self.aacVideoOffset : 0),
             samples: [MP4Sample(data: frame.data, duration: UInt32(frameTicks), isSync: frame.isKeyframe)])
         onChunk?(.video(fragment, keyframe: frame.isKeyframe))
     }
 
     private func emitAudio() {
-        guard let audio, let packets = audio.takePackets() else { return }
-        // Audio before the first init segment has nothing to belong to.
-        guard initSegment != nil else { return }
+        guard let aac, let packets = aac.takePackets() else { return }
+        // Audio before an init segment with its track has nothing to belong to.
+        guard initHasAAC else { return }
         sequence += 1
         let samples = packets.data.map { MP4Sample(data: $0, duration: UInt32(AudioEncoder.samplesPerPacket), isSync: true) }
         let fragment = FMP4.fragment(
@@ -171,5 +264,22 @@ public final class MirrorStream: @unchecked Sendable {
             baseDecodeTime: UInt64(packets.first) * UInt64(AudioEncoder.samplesPerPacket),
             samples: samples)
         onChunk?(.audio(fragment))
+    }
+
+    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        let interleaved = buffer.format.isInterleaved
+        let count = interleaved ? frames * channels : frames
+        let planes = interleaved ? 1 : channels
+        var peak: Float = 0
+        if let data = buffer.floatChannelData {
+            for plane in 0..<planes { for i in 0..<count { peak = max(peak, abs(data[plane][i])) } }
+        } else if let data = buffer.int16ChannelData {
+            for plane in 0..<planes { for i in 0..<count { peak = max(peak, abs(Float(data[plane][i])) / 32768) } }
+        } else if let data = buffer.int32ChannelData {
+            for plane in 0..<planes { for i in 0..<count { peak = max(peak, abs(Float(data[plane][i])) / 2_147_483_648) } }
+        }
+        return peak
     }
 }

@@ -8,6 +8,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,7 @@ import { DASHCAST_APP_ID, DASHCAST_NS, dashcastLoadMessage, receiverPageUrl } fr
 import { discoverChromecasts, localAddressFor } from './discovery.js';
 import { startFfmpeg } from './ffmpeg.js';
 import { FragmentSplitter } from './mp4.js';
+import { PcmPacker } from './pcm.js';
 import { startReplay } from './replay.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -41,7 +43,8 @@ Options:
                         dashcast opens the receiver page through the public
                         DashCast app, served from this PC, so no app ID is needed
   --page <url>          receiver page for dashcast      (default served from this PC)
-  --source <s>          desktop | test | file | replay  (default desktop)
+  --source <s>          desktop | test | synctest | file | replay  (default desktop)
+                        synctest flashes white with a beep at the start of every second
   --file <path>         video file for --source file (loops), or a stream
                         recorded by the iOS tests for --source replay
   --capture <c>         ddagrab | gdigrab               (default ddagrab)
@@ -53,6 +56,10 @@ Options:
   --encoder <e>         x264 | qsv                      (default x264)
   --preset <p>          x264 preset                     (default ultrafast)
   --audio               add a test tone (file sources keep their own audio)
+  --sound <s>           mp4 | pcm  where the sound goes (default mp4)
+                        mp4: inside the video stream (the Chromecast holds ~2 s)
+                        pcm: apart from it, played by the receiver with Web Audio
+  --avoffset <ms>       play separate sound this much later (+) or earlier (-)
   --transport <t>       auto | ws | cast                (default auto)
   --port <n>            WebSocket port                  (default 8765)
   --target <ms>         receiver buffer target
@@ -83,6 +90,8 @@ function parseOptions() {
       encoder: { type: 'string', default: 'x264' },
       preset: { type: 'string', default: 'ultrafast' },
       audio: { type: 'boolean', default: false },
+      sound: { type: 'string', default: 'mp4' },
+      avoffset: { type: 'string' },
       transport: { type: 'string', default: 'auto' },
       port: { type: 'string', default: '8765' },
       'http-port': { type: 'string', default: '8080' },
@@ -105,6 +114,7 @@ function parseOptions() {
     httpPort: Number(values['http-port']),
     target: values.target === undefined ? undefined : Number(values.target) / 1000,
     jump: values.jump === undefined ? undefined : Number(values.jump) / 1000,
+    avOffset: values.avoffset === undefined ? undefined : Number(values.avoffset),
   };
 }
 
@@ -120,17 +130,46 @@ class Stream {
     this.waitingForKey = true;
     this.stopped = false;
     this.backlogLimit = Math.max(256 * 1024, bitrateBytesPerSec(opts.bitrate) * 0.2);
-    this.stats = { frames: 0, bytes: 0, dropped: 0, since: Date.now() };
+    this.stats = { frames: 0, bytes: 0, soundBytes: 0, dropped: 0, since: Date.now() };
     this.statsTimer = setInterval(() => this.printStats(), 5000);
   }
 
   start() {
     console.log(`[stream] starting ${this.opts.source} ${this.opts.width}x${this.opts.height}@${this.opts.fps} `
-      + `${this.opts.bitrate} via ${this.sink.kind}`);
-    const startedAt = Date.now();
+      + `${this.opts.bitrate} via ${this.sink.kind}${this.opts.sound === 'pcm' ? ', separate sound' : ''}`);
     this.splitter = new FragmentSplitter();
-    const run = this.opts.source === 'replay' ? startReplay : startFfmpeg;
-    this.proc = run(this.opts, (d) => this.onData(d), (code) => {
+    if (this.opts.sound === 'pcm' && this.opts.source !== 'replay') {
+      this.listenForSound((pcmUrl) => this.run({ ...this.opts, pcmUrl }));
+    } else {
+      this.run(this.opts);
+    }
+  }
+
+  // FFmpeg writes separate sound to a local TCP port (Windows can't reliably
+  // give it a third pipe), and it goes out as 'cmau' chunks.
+  listenForSound(then) {
+    if (this.soundServer) this.soundServer.close();
+    const packer = new PcmPacker();
+    const server = net.createServer((sock) => {
+      sock.on('data', (d) => {
+        for (const chunk of packer.push(d)) this.sendSound(chunk);
+      });
+      sock.on('error', () => { /* FFmpeg restarting */ });
+    });
+    server.listen(0, '127.0.0.1', () => then(`tcp://127.0.0.1:${server.address().port}`));
+    this.soundServer = server;
+  }
+
+  sendSound(chunk) {
+    if (this.stopped) return;
+    this.sink.send(chunk);
+    this.stats.soundBytes += chunk.length;
+  }
+
+  run(runOpts) {
+    const startedAt = Date.now();
+    const run = runOpts.source === 'replay' ? startReplay : startFfmpeg;
+    this.proc = run(runOpts, (d) => this.onData(d), (code) => {
       if (this.stopped) return;
       // Desktop capture ends whenever Windows takes the screen away (lock
       // screen, UAC prompt, display change), so start again. The new init
@@ -154,6 +193,10 @@ class Stream {
       return;
     }
     for (const c of chunks) {
+      if (c.kind === 'audio') {
+        this.sendSound(c.data);
+        continue;
+      }
       if (c.kind === 'init') {
         this.sink.send(c.data);
         this.waitingForKey = true;
@@ -179,9 +222,10 @@ class Stream {
     const secs = (Date.now() - this.stats.since) / 1000;
     const fps = (this.stats.frames / secs).toFixed(1);
     const mbps = ((this.stats.bytes * 8) / secs / 1e6).toFixed(1);
-    console.log(`[stream] sent ${fps} fps, ${mbps} Mbps, dropped ${this.stats.dropped}, `
+    const sound = this.stats.soundBytes ? `, sound ${Math.round(this.stats.soundBytes / secs / 1024)} KB/s` : '';
+    console.log(`[stream] sent ${fps} fps, ${mbps} Mbps${sound}, dropped ${this.stats.dropped}, `
       + `backlog ${Math.round(this.sink.backlog() / 1024)} KB`);
-    this.stats = { frames: 0, bytes: 0, dropped: 0, since: Date.now() };
+    this.stats = { frames: 0, bytes: 0, soundBytes: 0, dropped: 0, since: Date.now() };
   }
 
   stop() {
@@ -190,6 +234,7 @@ class Stream {
     clearInterval(this.statsTimer);
     clearTimeout(this.restartTimer);
     if (this.proc) this.proc.kill();
+    if (this.soundServer) this.soundServer.close();
   }
 }
 
@@ -234,7 +279,8 @@ function handleReceiverMessage(msg, reply, onReady) {
     console.log(`[tv] ${s.res} @ ${s.fps} fps via ${s.transport}, plays ${s.play}x (ready ${s.ready}`
       + `${s.paused ? ', paused' : ''}), audio ${s.audio}, `
       + `buffer ${s.lagMs} ms, rtt ${s.rttMs} ms, rate ${s.rate}, `
-      + `${s.mbps} Mbps, dropped ${s.dropped}, jumps ${s.jumps}, stalls ${s.stalls}, queue max ${s.maxQueue}`);
+      + `${s.mbps} Mbps, dropped ${s.dropped}, jumps ${s.jumps}, stalls ${s.stalls}, queue max ${s.maxQueue}`
+      + (s.sound ? `\n[tv]   sound ${s.sound}` : ''));
   } else if (msg.type === 'ready' && onReady) {
     onReady(msg);
   }
@@ -407,6 +453,7 @@ async function runCast(opts) {
       debug: !opts.quiet,
       target: opts.target,
       jump: opts.jump,
+      avOffset: opts.avOffset,
     });
     client.sendToApp(DASHCAST_NS, dashcastLoadMessage(page));
     console.log(`Opening ${page} on the TV. Ctrl+C stops.`);

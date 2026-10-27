@@ -21,19 +21,26 @@ final class AudioEncoder {
     var config: AudioTrackConfig { AudioTrackConfig(sampleRate: Self.sampleRate, channels: Self.channels) }
 
     /// Next sample position (48 kHz, from the stream's start) to be encoded.
-    private(set) var nextSample: Int64 = 0
+    private(set) var nextSample: Int64
+    /// App audio dropped because silence or earlier audio already covered
+    /// its time, in samples.
+    private(set) var droppedSamples: Int64 = 0
 
     private let pcmFormat: AVAudioFormat
     private let encoder: AVAudioConverter
-    private var resampler: AVAudioConverter?
+    private let resampler: AudioResampler
     private var encoderInput: [AVAudioPCMBuffer] = []
     private var packets: [Data] = []
-    private var packetsTaken: Int64 = 0
+    private var packetsTaken: Int64
 
-    init?() {
-        guard let pcm = AVAudioFormat(standardFormatWithSampleRate: Double(Self.sampleRate), channels: AVAudioChannelCount(Self.channels)) else {
-            return nil
-        }
+    /// Starts at `startSample` (rounded down to a whole packet), for sound
+    /// switched on partway through a stream.
+    init?(startSample: Int64 = 0) {
+        guard let resampler = AudioResampler() else { return nil }
+        let pcm = resampler.outputFormat
+        let packet = Int64(Self.samplesPerPacket)
+        packetsTaken = max(0, startSample) / packet
+        nextSample = packetsTaken * packet
         var aac = AudioStreamBasicDescription(
             mSampleRate: Double(Self.sampleRate), mFormatID: kAudioFormatMPEG4AAC,
             mFormatFlags: UInt32(MPEG4ObjectID.AAC_LC.rawValue), mBytesPerPacket: 0,
@@ -45,12 +52,13 @@ final class AudioEncoder {
         encoder.bitRate = 128_000
         pcmFormat = pcm
         self.encoder = encoder
+        self.resampler = resampler
     }
 
     /// Adds app audio that starts at `startSample` (48 kHz, from the stream's
     /// start), in any PCM format.
     func append(_ buffer: AVAudioPCMBuffer, startSample: Int64) {
-        guard let pcm = resample(buffer), pcm.frameLength > 0 else { return }
+        guard let pcm = resampler.convert(buffer), pcm.frameLength > 0 else { return }
         let drift = startSample - nextSample
         let slack = Int64(Self.samplesPerPacket)
         var skip: Int64 = 0
@@ -62,6 +70,7 @@ final class AudioEncoder {
         } else if drift < -slack {
             skip = -drift  // already covered, by silence or earlier audio
         }
+        droppedSamples += min(skip, Int64(pcm.frameLength))
         if skip >= Int64(pcm.frameLength) { return }
         feed(skip > 0 ? slice(pcm, from: Int(skip)) : pcm)
     }
@@ -126,21 +135,43 @@ final class AudioEncoder {
         }
     }
 
-    /// Converts app audio to 48 kHz stereo float, keeping the converter
-    /// between calls so resampling stays continuous.
-    private func resample(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        if buffer.format == pcmFormat { return buffer }
-        if resampler == nil || resampler?.inputFormat != buffer.format {
-            resampler = AVAudioConverter(from: buffer.format, to: pcmFormat)
+    private func slice(_ buffer: AVAudioPCMBuffer, from start: Int) -> AVAudioPCMBuffer {
+        let frames = Int(buffer.frameLength) - start
+        guard let output = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: AVAudioFrameCount(frames)),
+              let source = buffer.floatChannelData, let target = output.floatChannelData else { return buffer }
+        output.frameLength = AVAudioFrameCount(frames)
+        for channel in 0..<Int(buffer.format.channelCount) {
+            target[channel].update(from: source[channel] + start, count: frames)
+        }
+        return output
+    }
+}
+
+/// Converts app audio to 48 kHz stereo float, keeping the converter between
+/// calls so resampling stays continuous.
+final class AudioResampler {
+    let outputFormat: AVAudioFormat
+    private var converter: AVAudioConverter?
+
+    init?() {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: Double(AudioEncoder.sampleRate),
+                                         channels: AVAudioChannelCount(AudioEncoder.channels)) else { return nil }
+        outputFormat = format
+    }
+
+    func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if buffer.format == outputFormat { return buffer }
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: outputFormat)
             logInfo("audio: app audio is \(Int(buffer.format.sampleRate)) Hz, \(buffer.format.channelCount) channels")
         }
-        guard let resampler else { return nil }
-        let ratio = pcmFormat.sampleRate / buffer.format.sampleRate
+        guard let converter else { return nil }
+        let ratio = outputFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 64
-        guard let output = AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: capacity) else { return nil }
+        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return nil }
         var given = false
         var error: NSError?
-        _ = resampler.convert(to: output, error: &error) { _, inputStatus in
+        _ = converter.convert(to: output, error: &error) { _, inputStatus in
             if given {
                 inputStatus.pointee = .noDataNow
                 return nil
@@ -151,16 +182,54 @@ final class AudioEncoder {
         }
         return output
     }
+}
 
-    private func slice(_ buffer: AVAudioPCMBuffer, from start: Int) -> AVAudioPCMBuffer {
-        let frames = Int(buffer.frameLength) - start
-        guard let output = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: AVAudioFrameCount(frames)),
-              let source = buffer.floatChannelData, let target = output.floatChannelData else { return buffer }
-        output.frameLength = AVAudioFrameCount(frames)
-        for channel in 0..<Int(buffer.format.channelCount) {
-            target[channel].update(from: source[channel] + start, count: frames)
+/// Sound sent apart from the picture (SoundMode.tv): 16-bit stereo PCM at
+/// 48 kHz in 'cmau' chunks shaped like MP4 boxes:
+///   u32 size, 'cmau', u64 first sample (48 kHz, from the stream's start),
+///   then little-endian samples, left and right interleaved.
+/// Same as pc-sender/src/pcm.js; receiver/receiver.js plays them with Web
+/// Audio, lined up with the video by the sample number.
+final class PCMPacker {
+    static let headerSize = 16
+
+    /// Sample number the next chunk starts at, when back to back.
+    private(set) var nextSample: Int64?
+    private let resampler: AudioResampler
+
+    init?() {
+        guard let resampler = AudioResampler() else { return nil }
+        self.resampler = resampler
+    }
+
+    /// One chunk for app audio that starts at `startSample`.
+    func chunk(for buffer: AVAudioPCMBuffer, startSample: Int64) -> Data? {
+        guard let pcm = resampler.convert(buffer), pcm.frameLength > 0,
+              let channels = pcm.floatChannelData else { return nil }
+        let frames = Int(pcm.frameLength)
+        // Back to back with the last chunk unless the timestamps jumped.
+        var first = startSample
+        if let next = nextSample, abs(startSample - next) <= Int64(AudioEncoder.samplesPerPacket) { first = next }
+        nextSample = first + Int64(frames)
+
+        var data = Data(count: Self.headerSize + frames * 4)
+        data.withUnsafeMutableBytes { raw in
+            raw.storeBytes(of: UInt32(raw.count).bigEndian, toByteOffset: 0, as: UInt32.self)
+            raw.storeBytes(of: UInt32(0x636d_6175).bigEndian, toByteOffset: 4, as: UInt32.self)  // 'cmau'
+            raw.storeBytes(of: UInt64(first).bigEndian, toByteOffset: 8, as: UInt64.self)
+            let left = channels[0]
+            let right = pcm.format.channelCount > 1 ? channels[1] : channels[0]
+            for i in 0..<frames {
+                let offset = Self.headerSize + i * 4
+                raw.storeBytes(of: Self.int16(left[i]).littleEndian, toByteOffset: offset, as: Int16.self)
+                raw.storeBytes(of: Self.int16(right[i]).littleEndian, toByteOffset: offset + 2, as: Int16.self)
+            }
         }
-        return output
+        return data
+    }
+
+    private static func int16(_ value: Float) -> Int16 {
+        Int16(max(-32768, min(32767, (value * 32768).rounded())))
     }
 }
 

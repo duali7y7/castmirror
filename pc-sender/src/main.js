@@ -56,7 +56,7 @@ Options:
   --transport <t>       auto | ws | cast                (default auto)
   --port <n>            WebSocket port                  (default 8765)
   --target <ms>         receiver buffer target
-                        (default 400 on a Chromecast, 1000 with audio, where it can't
+                        (default 350 on a Chromecast, 1000 with audio, where it can't
                         speed up to catch up; 150, or 300 with audio, in a browser)
   --jump <ms>           receiver jumps to live past this
                         (default target + 3000 on a Chromecast, target + 450 in a browser)

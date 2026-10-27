@@ -19,7 +19,7 @@ public final class MirrorStream: @unchecked Sendable {
         public var maxWidth = 1920
         public var maxHeight = 1080
         /// With sound, the Chromecast holds about 2 s of stream and can't
-        /// catch up; without, about 0.4 s. So the sound stays on the phone.
+        /// catch up; without, about 0.35 s. So the sound stays on the phone.
         public var includeAudio = false
 
         public init() {}

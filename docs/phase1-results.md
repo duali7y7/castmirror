@@ -22,7 +22,7 @@ The `[tv]` lines in the sender's output give buffer, rtt, fps and stalls for eac
 - **Speeding up does work.** With `playbackRate` up to 1.25 to catch up, and no jumps, it plays smoothly.
 - **The buffer floor is about 300 ms.** A 200 ms target ran dry (a stall in 35 s, readyState 2, couldn't keep up even at 1.25x). A 500 ms target settled at 310–400 ms with no stalls.
 - **Sound stops once `playbackRate` changes**, and stays off after it returns to 1. The tone decoded (player volume 100%, device volume 95%) but wasn't heard until a run that never changed speed. So with sound it can't speed up either, and the delay stays at what it buffers before it starts playing: about 1.7–1.9 s with sound, 1.2–1.4 s without. Sound and picture come from the same stream and stay in sync.
-- Defaults on the Chromecast are now: video only, a 400 ms target reached by speeding up; with sound, normal speed only. Either way, a jump only past target + 3 s.
+- Defaults on the Chromecast are now: video only, a 350 ms target reached by speeding up (400 ms until the v1 tuning below); with sound, normal speed only. Either way, a jump only past target + 3 s.
 
 ## Runs
 
@@ -39,6 +39,18 @@ Desktop capture with ddagrab, x264 ultrafast, 1920x1080@30. The desktop was most
 | desktop | 8M      | tone  | 1000 (default) | none, jump at 4000 | 1745–1900    | 29–31     | 0 in 30 s          | **1.93 s**    | new default with sound; photo: PC 33.423, TV 31.490 |
 
 The measured delay is the TV's buffer (about 1.8 s) plus about 0.13 s for capture, encoding, Wi-Fi and display.
+
+### v1 tuning (picture only, 27 Oct)
+
+The first phone test had 2088 ms of buffer with sound, so v1 sends picture only. These runs picked the video-only target. Test pattern (`--source test`, 1920x1080@30, 6 Mbps), 130 s each, PC on Wi-Fi with an rtt of 8–33 ms:
+
+| Target (ms) | Buffer on TV after catch-up (ms) | fps on TV | Stalls after start | Notes |
+|-------------|----------------------------------|-----------|--------------------|-------|
+| 300         | 143–391, mostly 200–320          | 27–33     | 0                  | |
+| 350         | 164–351, mostly 190–340          | 30–32     | 0                  | chosen: same buffer as 300 in practice, a little more headroom for the phone's Wi-Fi |
+| 400         | not run (the Chromecast went off the network) | | | |
+
+The buffer sits below the target most of the time: the receiver only speeds up when it's more than 40 ms over, and the player drifts down from there. The catch-up from the 1.4–1.8 s start-up buffer took 5–10 s.
 
 ## Open questions
 

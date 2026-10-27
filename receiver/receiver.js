@@ -39,7 +39,7 @@
 
   function targetLag() {
     if (config.targetLag !== null) return config.targetLag;
-    if (isCast) return player.hasAudio ? 1 : 0.4;
+    if (isCast) return player.hasAudio ? 1 : 0.35;
     return player.hasAudio ? 0.3 : 0.15;
   }
 
